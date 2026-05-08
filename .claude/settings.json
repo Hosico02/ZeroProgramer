@@ -24,6 +24,7 @@
       "Bash(./bin/tm-decision:*)",
       "Bash(./bin/tm-risk-list:*)",
       "Bash(./bin/tm-vision:*)",
+      "Bash(./bin/tm-github-sync:*)",
       "Bash(tm-pm:*)",
       "Bash(tm-done:*)",
       "Bash(tm-plan-cycle:*)",
@@ -36,6 +37,8 @@
       "Bash(tm-decision:*)",
       "Bash(tm-risk-list:*)",
       "Bash(tm-vision:*)",
+      "Bash(tm-github-sync:*)",
+      "Bash(gh:*)",
       "Bash(osascript:*)"
     ]
   },

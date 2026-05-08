@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# tm-github-sync — keep GitHub Issues in sync with the project's escalations/.
+#
+# Reading: each escalations/task-NNNN.md becomes (or maps to) a GitHub issue
+# in the configured repo. The mapping is stored in .gh-issue-map.json.
+#
+# Direction:
+#   open:  if escalations/task-NNNN.md exists and there's no live issue,
+#          open one and record the issue number.
+#   close: if escalations/task-NNNN.md is GONE (resolved manually or via
+#          tm-supervise revise-goal that retired it), close the linked
+#          issue with a comment.
+#
+# This is one-way for now (no GitHub → escalation). Adding the reverse is a
+# future feature.
+#
+# Usage:
+#   tm-github-sync             # one-shot sync of current state
+#   tm-github-sync --dry-run   # show what would change without doing it
+#
+# Env / config:
+#   TM_GH_REPO         override (default: parsed from `git remote get-url origin`)
+#   TM_GH_LABEL        label to attach to opened issues (default: "tm-escalation")
+#   TM_GH_ENABLED      set to 0 to skip (lets cron call this safely; no-op when disabled)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ESC_DIR="$ROOT/escalations"
+MAP="$ROOT/.gh-issue-map.json"
+LABEL="${TM_GH_LABEL:-tm-escalation}"
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+# Disabled by env var → no-op (useful for cron / CI without enabling everywhere).
+if [ "${TM_GH_ENABLED:-1}" = "0" ]; then
+  echo "tm-github-sync: TM_GH_ENABLED=0, skipping" >&2
+  exit 0
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "tm-github-sync: gh CLI not found in PATH; install from https://cli.github.com/" >&2
+  exit 2
+fi
+
+# Detect repo: explicit env beats git remote.
+if [ -n "${TM_GH_REPO:-}" ]; then
+  REPO="$TM_GH_REPO"
+else
+  url=$(git -C "$ROOT" remote get-url origin 2>/dev/null || echo "")
+  REPO=$(printf '%s' "$url" | sed -E 's#.*github\.com[:/]([^/]+/[^/]+)(\.git)?$#\1#; s#\.git$##')
+fi
+if [ -z "$REPO" ]; then
+  echo "tm-github-sync: could not detect github repo. set TM_GH_REPO=owner/repo" >&2
+  exit 3
+fi
+
+# Initialize map file if missing.
+[ -f "$MAP" ] || echo '{}' > "$MAP"
+
+read_map() {
+  python3 -c "
+import json, sys
+m = json.load(open('$MAP'))
+print(m.get(sys.argv[1], ''))
+" "$1"
+}
+
+write_map() {
+  # write_map <task-id> <issue-number>
+  python3 - "$MAP" "$1" "$2" <<'PY'
+import json, sys
+path, k, v = sys.argv[1], sys.argv[2], sys.argv[3]
+m = json.load(open(path))
+m[k] = int(v)
+tmp = path + ".tmp"
+json.dump(m, open(tmp, "w"), indent=2)
+import os; os.replace(tmp, path)
+PY
+}
+
+drop_map() {
+  python3 - "$MAP" "$1" <<'PY'
+import json, sys
+path, k = sys.argv[1], sys.argv[2]
+m = json.load(open(path))
+m.pop(k, None)
+tmp = path + ".tmp"
+json.dump(m, open(tmp, "w"), indent=2)
+import os; os.replace(tmp, path)
+PY
+}
+
+declare -i opened=0 closed=0 skipped=0
+
+# 1. open new issues for escalations not yet mapped
+if [ -d "$ESC_DIR" ]; then
+  for f in "$ESC_DIR"/task-*.md; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f" .md)             # e.g. task-0042
+    tid="${base#task-}"
+    tid="${tid#0}"; tid="${tid#0}"; tid="${tid#0}"   # strip leading zeros
+    existing=$(read_map "$tid")
+    if [ -n "$existing" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    title=$(sed -n '1s/^# //p' "$f" | head -1)
+    title="${title:-Escalated task #${tid}}"
+    body=$(cat "$f")
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "DRY: would open issue for $base in $REPO"
+      opened=$((opened + 1))
+      continue
+    fi
+    issue_url=$(gh issue create \
+      --repo "$REPO" \
+      --title "[tm] $title" \
+      --body "$body" \
+      --label "$LABEL" 2>&1 || true)
+    issue_num=$(printf '%s' "$issue_url" | grep -oE '/issues/[0-9]+' | grep -oE '[0-9]+' | tail -1)
+    if [ -n "$issue_num" ]; then
+      write_map "$tid" "$issue_num"
+      echo "✓ opened #$issue_num for $base"
+      opened=$((opened + 1))
+    else
+      echo "✗ failed to open issue for $base: $issue_url" >&2
+    fi
+  done
+fi
+
+# 2. close issues whose escalation file has been removed
+# (use process substitution so 'closed' updates in the parent shell)
+while read -r tid issuenum; do
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "DRY: would close issue #$issuenum (escalation task-$tid resolved)"
+    closed=$((closed + 1))
+    continue
+  fi
+  if gh issue close "$issuenum" --repo "$REPO" \
+       --comment "Resolved — escalation file removed by supervisor or revise-goal." \
+       >/dev/null 2>&1; then
+    drop_map "$tid"
+    echo "✓ closed #$issuenum (escalation task-$tid resolved)"
+    closed=$((closed + 1))
+  else
+    echo "✗ failed to close issue #$issuenum" >&2
+  fi
+done < <(python3 - "$MAP" "$ESC_DIR" <<'PY'
+import json, os, sys
+mpath, edir = sys.argv[1], sys.argv[2]
+m = json.load(open(mpath))
+for tid, issuenum in list(m.items()):
+    f = os.path.join(edir, f"task-{int(tid):04d}.md")
+    if not os.path.exists(f):
+        print(f"{tid} {issuenum}")
+PY
+)
+
+echo
+echo "tm-github-sync: opened=$opened, closed=$closed, skipped=$skipped (repo: $REPO)"

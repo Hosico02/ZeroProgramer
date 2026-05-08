@@ -135,6 +135,7 @@ PY
     # NOTE: vision.md is user-authored (like goal.md) — not wiped by reset
     rm -f  "$ROOT/pm-state.json" "$ROOT/pm.log" "$ROOT/.session-id"
     rm -f  "$ROOT/planner.log" "$ROOT/planner.pid" "$ROOT/supervisor.log"
+    rm -f  "$ROOT/.gh-issue-map.json"
     mkdir -p "$ROOT/events" "$ROOT/tasks" "$ROOT/nags"
     echo "✓ reset (events/, tasks/, nags/, escalations/, goal-history/, .promoted-bak/, status-reports/, decisions/, pm-state.json, pm.log, planner.log, supervisor.log, .session-id)"
     ;;

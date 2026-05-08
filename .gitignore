@@ -21,6 +21,9 @@ bin/.promoted-bak/
 # ── third-party agent state ──
 .teamagent/
 
+# ── tm-github-sync state ──
+.gh-issue-map.json
+
 # ── workspace/ runtime state (workspace is the agent's edit area; the
 #    project files inside it are committed, but PM runtime is not) ──
 workspace/events/

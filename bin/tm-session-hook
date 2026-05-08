@@ -97,6 +97,12 @@ YOUR JOB (think like a project manager)
       - vision.md item / proposals/ proposal is mature enough to graduate
         into goal.md (move it from "could do" to "doing")
 
+  • **GitHub sync (optional)**: if the repo has a github remote and
+    \`gh\` is authenticated, run \`tm-github-sync\` to file each
+    open escalation as a GitHub issue and close issues whose escalations
+    have been resolved. Skip if not applicable. Set TM_GH_ENABLED=0 to
+    silence permanently.
+
   • **Promote a vision proposal**: \`tm-vision list\` shows any
     proposals/ entries. If one looks ready, do:
         tm-vision show <N>           # read full proposal
