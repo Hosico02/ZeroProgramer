@@ -26,7 +26,8 @@ def daemon_running() -> bool:
 
 
 def main() -> int:
-    proj = ROOT.name
+    # Same resolution as tm-statusline: env var overrides dir name.
+    proj = os.environ.get("TM_PROJECT_NAME", "").strip() or ROOT.name
     dot = "●" if daemon_running() else "○"
     if not STATE.exists():
         print(f"{dot} {proj} · idle")
