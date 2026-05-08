@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""tm-risk-list — surface tasks at risk, for the supervisor's quick triage.
+
+Computes risk signals from pm-state.json + pm.log:
+  - reclaim_count: how many times the daemon has had to reclaim this task
+                   from a stale worker (>= 2 = task likely too big or flaky)
+  - signal_attempts: signal_cmd has failed N times (>= 2 = verifier or impl
+                     needs review)
+  - review_attempts: reviewer rejected N times (strict mode)
+  - long_in_progress: in-progress for > 600s
+
+Usage:
+  tm-risk-list           # human-readable list, sorted worst-first
+  tm-risk-list --json    # JSON output for scripting
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = ROOT / "pm-state.json"
+LOG = ROOT / "pm.log"
+
+LONG_IN_PROGRESS_SEC = 600
+
+
+def reclaim_counts(log_path: Path) -> dict[int, int]:
+    counts: Counter[int] = Counter()
+    if not log_path.exists():
+        return {}
+    for raw in log_path.read_text(errors="ignore").splitlines():
+        m = re.search(r"reclaimed task #(\d+)", raw)
+        if m:
+            counts[int(m.group(1))] += 1
+    return dict(counts)
+
+
+def collect(state: dict) -> list[dict]:
+    rc = reclaim_counts(LOG)
+    now = datetime.datetime.utcnow()
+    risks = []
+
+    for t in state.get("tasks", []):
+        tid = t["id"]
+        title = t.get("title", "(no title)")[:80]
+        status = t.get("status", "?")
+        signals = []
+        score = 0
+
+        n_reclaim = rc.get(tid, 0)
+        if n_reclaim >= 2:
+            signals.append(f"reclaimed {n_reclaim}×")
+            score += n_reclaim * 3
+
+        sa = t.get("signal_attempts", 0) or 0
+        if sa >= 2:
+            signals.append(f"signal_cmd failed {sa}×")
+            score += sa * 2
+
+        ra = t.get("review_attempts", 0) or 0
+        if ra >= 2:
+            signals.append(f"review rejected {ra}×")
+            score += ra * 2
+
+        if status == "in-progress":
+            s = t.get("started_ts")
+            if s:
+                try:
+                    ds = datetime.datetime.fromisoformat(s.rstrip("Z"))
+                    elapsed = (now - ds).total_seconds()
+                    if elapsed > LONG_IN_PROGRESS_SEC:
+                        signals.append(f"in-progress {int(elapsed)}s")
+                        score += int(elapsed / 60)
+                except Exception:
+                    pass
+
+        if signals:
+            risks.append({
+                "id": tid,
+                "status": status,
+                "title": title,
+                "signals": signals,
+                "score": score,
+            })
+
+    risks.sort(key=lambda r: -r["score"])
+    return risks
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not STATE.exists():
+        print("tm-risk-list: no pm-state.json", file=sys.stderr)
+        return 1
+    try:
+        state = json.loads(STATE.read_text())
+    except Exception as e:
+        print(f"tm-risk-list: pm-state.json unreadable: {e}", file=sys.stderr)
+        return 1
+
+    risks = collect(state)
+
+    if args and args[0] == "--json":
+        print(json.dumps(risks, indent=2))
+        return 0
+
+    if not risks:
+        print("✓ no risks surfaced — all tasks within normal parameters")
+        return 0
+
+    print(f"⚠️  {len(risks)} task(s) at risk (worst first):")
+    print()
+    for r in risks:
+        print(f"  task #{r['id']} [{r['status']}] (risk score {r['score']})")
+        print(f"    {r['title']}")
+        for s in r["signals"]:
+            print(f"      · {s}")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

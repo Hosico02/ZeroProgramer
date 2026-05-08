@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Profile workspace/ via `claude -p` and have the agent WRITE manifest.json
+# directly using the Write tool — avoids the lossy "JSON-in-text" channel.
+#
+# Usage: tm-profile          # writes manifest.json
+#        tm-profile --force  # overwrite existing manifest
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="$ROOT/workspace"
+MANIFEST="$ROOT/manifest.json"
+
+force=0
+[ "${1:-}" = "--force" ] && force=1
+
+if [ ! -d "$WORKSPACE" ] || [ -z "$(ls -A "$WORKSPACE" 2>/dev/null)" ]; then
+  echo "tm-profile: workspace/ is empty — nothing to profile" >&2
+  exit 1
+fi
+
+if [ -f "$MANIFEST" ] && [ "$force" -eq 0 ]; then
+  echo "manifest.json exists. Use --force to regenerate." >&2
+  exit 1
+fi
+
+if ! command -v claude >/dev/null; then
+  echo "tm-profile: 'claude' CLI not found in PATH" >&2
+  exit 2
+fi
+
+GOAL_TXT=""
+[ -f "$ROOT/goal.md" ] && GOAL_TXT=$(cat "$ROOT/goal.md")
+
+prompt="You are a code auditor. Read the project under \`$WORKSPACE\` and decide which project-specific dimensions of quality genuinely matter for THIS code, then WRITE the result to \`$MANIFEST\` using your Write tool.
+
+PROJECT GOAL (if any):
+---
+$GOAL_TXT
+---
+
+Steps:
+1. Read efficiently — README, main source files, tests. Don't recurse deeply.
+2. Probe each candidate dimension with concrete commands (run pytest, grep for patterns, etc.) so 'satisfied' reflects reality.
+3. Use the Write tool to write a JSON file at exactly \`$MANIFEST\` with this schema:
+
+{
+  \"project_kind\": \"<one short sentence>\",
+  \"dimensions\": [
+    {
+      \"name\": \"<short_snake_case>\",
+      \"why\": \"<one sentence — why this dimension matters for THIS project>\",
+      \"what_to_audit\": \"<concrete things to look for in code>\",
+      \"signal_cmd\": \"<shell command, runnable from $WORKSPACE, exit 0 ⇒ this dimension is satisfied>\",
+      \"current_state\": \"<one short sentence — what you observed>\",
+      \"satisfied\": true
+    }
+  ]
+}
+
+Rules:
+- 3-7 dimensions. Pick the ones with most leverage for THIS project, not a generic checklist.
+- signal_cmd is a real shell command whose exit code is the truth. Prefer simple commands: \`grep -q 'pattern' file\`, \`python3 -m pytest -q -k keyword\`, \`test -f file\`. Avoid python -c with embedded quotes — they are hard to escape inside JSON.
+- Set satisfied=true ONLY if you actually ran the signal_cmd and it exited 0. Be honest — false is more useful than wishful true.
+- If a dimension can't be expressed as a single, simple command, omit it.
+
+After Write succeeds, reply with one line: 'manifest written'. No further prose, no JSON in text."
+
+echo "▸ profiling $WORKSPACE … (claude -p will Write the manifest)" >&2
+log=$(mktemp -t tm-profile.XXXXXX)
+TM_AUTO=1 claude -p \
+  --allowedTools "Read,Bash,Grep,Glob,Write" \
+  --append-system-prompt "Be concise. Use tools. End by calling Write to $MANIFEST and replying 'manifest written'." \
+  "$prompt" >"$log" 2>&1 || true
+
+if [ ! -f "$MANIFEST" ]; then
+  echo "tm-profile: manifest.json was not written. agent log tail:" >&2
+  tail -n 30 "$log" >&2
+  exit 4
+fi
+
+# Validate JSON
+python3 - "$MANIFEST" <<'PY'
+import json, sys
+try:
+    obj = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"tm-profile: manifest.json is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(5)
+dims = obj.get("dimensions") or []
+if not isinstance(dims, list) or not dims:
+    print("tm-profile: manifest has no dimensions", file=sys.stderr)
+    sys.exit(6)
+print(f"✓ manifest with {len(dims)} dimensions", file=sys.stderr)
+print(f"  project_kind: {obj.get('project_kind','(unknown)')}", file=sys.stderr)
+for d in dims:
+    state = "✓" if d.get("satisfied") else "✗"
+    print(f"  {state} {d.get('name','?'):28s} {d.get('current_state','')[:80]}", file=sys.stderr)
+PY
+rm -f "$log"

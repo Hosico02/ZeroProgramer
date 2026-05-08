@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""tm-context — query past task summaries from pm-state.json.
+
+Workers use this to avoid redoing work another worker already finished:
+  tm-context              # one-line overview of every task
+  tm-context list         # same as above
+  tm-context done         # only done tasks, with summaries
+  tm-context show <id>    # full details for one task
+  tm-context search <q>   # tasks whose title or summary contains <q>
+
+Stateless: reads pm-state.json on each call.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = ROOT / "pm-state.json"
+
+STATUS_MARK = {
+    "done": "✓",
+    "in-progress": "▶",
+    "todo": "·",
+    "failed": "✗",
+}
+
+
+def load_tasks() -> list[dict]:
+    if not STATE.exists():
+        print("(no pm-state.json — daemon hasn't started yet)", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(STATE.read_text()).get("tasks", [])
+
+
+def cmd_list(tasks: list[dict], filter_status: str | None = None) -> None:
+    if not tasks:
+        print("(no tasks)")
+        return
+    width = max((len(str(t["id"])) for t in tasks), default=1)
+    for t in tasks:
+        if filter_status and t["status"] != filter_status:
+            continue
+        mark = STATUS_MARK.get(t["status"], "?")
+        deps = t.get("depends_on") or []
+        deps_s = f" deps={deps}" if deps else ""
+        title = t["title"]
+        if len(title) > 100:
+            title = title[:97] + "..."
+        print(f"{mark} #{t['id']:>{width}} [{t['status']:11s}]{deps_s} {title}")
+        if filter_status == "done" and t.get("summary"):
+            print(f"     ↳ {t['summary']}")
+
+
+def cmd_show(tasks: list[dict], tid: int) -> None:
+    t = next((t for t in tasks if t["id"] == tid), None)
+    if not t:
+        print(f"(no task #{tid})", file=sys.stderr)
+        sys.exit(1)
+    print(f"#{t['id']} [{t['status']}] {t['title']}")
+    if t.get("depends_on"):
+        print(f"  depends_on: {t['depends_on']}")
+    if t.get("signal_cmd"):
+        print(f"  signal_cmd: {t['signal_cmd']}")
+    if t.get("assigned_to"):
+        print(f"  assigned_to: {t['assigned_to'][:12]}")
+    if t.get("started_ts"):
+        print(f"  started_ts: {t['started_ts']}")
+    if t.get("completed_ts"):
+        print(f"  completed_ts: {t['completed_ts']}")
+    if t.get("summary"):
+        print(f"  summary: {t['summary']}")
+    if t.get("review_history"):
+        print(f"  review_history ({len(t['review_history'])}):")
+        for r in t["review_history"]:
+            print(f"    [{r.get('ts','?')}] {r.get('verdict','?')} — {r.get('reason','')}")
+    if t.get("signal_history"):
+        print(f"  signal_history ({len(t['signal_history'])}):")
+        for s in t["signal_history"]:
+            print(f"    [{s.get('ts','?')}] exit={s.get('exit_code','?')}")
+            tail = (s.get("output_tail") or "").strip()
+            if tail:
+                for ln in tail.splitlines()[-5:]:
+                    print(f"      | {ln}")
+
+
+def cmd_search(tasks: list[dict], q: str) -> None:
+    q_lower = q.lower()
+    hits = [
+        t for t in tasks
+        if q_lower in (t.get("title") or "").lower()
+        or q_lower in (t.get("summary") or "").lower()
+    ]
+    if not hits:
+        print(f"(no tasks matching {q!r})")
+        return
+    cmd_list(hits)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    sub = args[0] if args else "list"
+    tasks = load_tasks()
+
+    if sub in ("list", "ls"):
+        cmd_list(tasks)
+    elif sub == "done":
+        cmd_list(tasks, filter_status="done")
+    elif sub == "todo":
+        cmd_list(tasks, filter_status="todo")
+    elif sub == "show":
+        if len(args) < 2:
+            print("usage: tm-context show <id>", file=sys.stderr); return 2
+        try:
+            tid = int(args[1])
+        except ValueError:
+            print(f"bad task id: {args[1]!r}", file=sys.stderr); return 2
+        cmd_show(tasks, tid)
+    elif sub == "search":
+        if len(args) < 2:
+            print("usage: tm-context search <query>", file=sys.stderr); return 2
+        cmd_search(tasks, " ".join(args[1:]))
+    elif sub in ("-h", "--help", "help"):
+        print(__doc__.strip())
+    else:
+        print(f"tm-context: unknown subcommand {sub!r}", file=sys.stderr)
+        print("usage: tm-context [list|done|todo|show <id>|search <q>]", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

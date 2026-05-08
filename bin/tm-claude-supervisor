@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Spawn an interactive Claude session in SUPERVISOR role with auto-go +
+# real-time status in the terminal title bar.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Background companion: every 2s update THIS terminal's title with PM state.
+# Self-terminates when this script exits.
+TM_ROLE=supervisor "$ROOT/bin/tm-title-keeper" &
+keeper=$!
+
+if [ $# -eq 0 ]; then
+  set -- "go"
+fi
+env TM_ROLE=supervisor claude "$@"
+ec=$?
+kill "$keeper" 2>/dev/null
+exit "$ec"

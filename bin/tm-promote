@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""tm-promote — sync improvements from workspace/bin/ back into the live bin/.
+
+The system's executor agents work inside workspace/, so when they harden
+pm-daemon.py or fix tm-review they only fix the COPY. The running daemon
+still uses bin/. tm-promote reviews those workspace changes and (with
+--apply) safely copies them back, after:
+
+  - confirming each file PARSES (bash -n for shell, py_compile for python),
+  - backing up the current bin/<f> into bin/.promoted-bak/<iso>/<f>,
+  - logging the operation to bin/.promoted-bak/<iso>/promotion.log.
+
+Usage:
+  tm-promote                     dry-run: show what would change
+  tm-promote --diff              dry-run + per-file diff
+  tm-promote --apply <f>...      apply only the named file(s) (basename)
+
+Safety:
+  - --apply REQUIRES explicit basenames. There's no "promote everything"
+    button on purpose — the workspace can be a stale snapshot missing
+    features that exist in bin/ (executor agents hardened narrow areas
+    while bin/ kept evolving). Each file must be a deliberate decision.
+  - Each candidate is syntax-checked (bash -n / py_compile) BEFORE any
+    write happens; one failure aborts the whole batch.
+  - Each promoted file is backed up to bin/.promoted-bak/<iso>/.
+  - tm-promote also flags "size regressions" (workspace file shorter
+    than bin/) as a likely-stale-snapshot signal — don't promote those
+    without reading the diff carefully.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import filecmp
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC_DIR = ROOT / "workspace" / "bin"
+DST_DIR = ROOT / "bin"
+BAK_ROOT = ROOT / "bin" / ".promoted-bak"
+
+# Files we never auto-promote — too system-critical, or the workspace copy
+# is by design a stale snapshot of these tools.
+SKIP = {
+    "tm-promote",          # us
+    "tm-goal-snapshot",    # not in workspace yet
+    "tm-claude-supervisor",
+    "tm-claude-planner",
+    "tm-claude-executor",
+    "tm-launch-helpers",
+    "tm-team-up",
+    "tm-pm",               # control surface; deliberate human-only territory
+    "setup-self-optimize", # bootstrap only
+}
+
+
+def shebang_kind(path: Path) -> str:
+    try:
+        first = path.read_bytes()[:200].splitlines()[0].decode(errors="ignore")
+    except Exception:
+        return "unknown"
+    if "#!" not in first:
+        return "no-shebang"
+    if "python" in first:
+        return "python"
+    if "bash" in first or "/sh" in first:
+        return "shell"
+    return "unknown"
+
+
+def syntax_check(path: Path) -> tuple[bool, str]:
+    kind = shebang_kind(path)
+    if kind == "python":
+        try:
+            import py_compile
+            py_compile.compile(str(path), doraise=True)
+            return True, "py_compile ok"
+        except Exception as e:
+            return False, f"py_compile failed: {e}"
+    if kind == "shell":
+        r = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+        if r.returncode == 0:
+            return True, "bash -n ok"
+        return False, f"bash -n failed: {r.stderr.strip()[:200]}"
+    # No shebang or unknown: don't gate on syntax (could be data file).
+    return True, f"skipped syntax check ({kind})"
+
+
+def diff_short(a: Path, b: Path) -> str:
+    """Compact unified diff, capped to ~30 lines for readability."""
+    r = subprocess.run(
+        ["diff", "-u", str(a), str(b)],
+        capture_output=True, text=True
+    )
+    out = r.stdout.splitlines()
+    if len(out) > 32:
+        out = out[:30] + [f"... [{len(out)-30} more lines]"]
+    return "\n".join(out)
+
+
+def discover_changes(only: set[str] | None) -> list[dict]:
+    if not SRC_DIR.is_dir():
+        print(f"tm-promote: no workspace/bin (workspace not initialized?)", file=sys.stderr)
+        sys.exit(2)
+
+    changes = []
+    for src in sorted(SRC_DIR.iterdir()):
+        if not src.is_file():
+            continue
+        name = src.name
+        if name in SKIP:
+            continue
+        if only and name not in only:
+            continue
+        dst = DST_DIR / name
+        status = "new" if not dst.exists() else (
+            "same" if filecmp.cmp(src, dst, shallow=False) else "modified"
+        )
+        if status == "same":
+            continue
+        # Flag suspected stale snapshot: workspace file shorter than bin/
+        regression = ""
+        if dst.exists():
+            src_lines = src.read_text(errors="ignore").count("\n")
+            dst_lines = dst.read_text(errors="ignore").count("\n")
+            delta = src_lines - dst_lines
+            if delta < -10:
+                regression = f"⚠ workspace is {abs(delta)} lines SHORTER (likely stale snapshot)"
+            elif delta < 0:
+                regression = f"⚠ workspace is {abs(delta)} lines shorter"
+        changes.append({
+            "name": name, "src": src, "dst": dst,
+            "status": status, "regression": regression,
+        })
+    return changes
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--apply", action="store_true",
+                   help="actually copy files (default is dry-run)")
+    p.add_argument("--diff", action="store_true",
+                   help="show per-file diff in dry-run output")
+    p.add_argument("files", nargs="*",
+                   help="restrict promotion to these basenames")
+    args = p.parse_args()
+
+    # --apply requires explicit file list; never apply blanket changes.
+    if args.apply and not args.files:
+        print("tm-promote: --apply requires one or more explicit basenames.\n"
+              "  workspace/ may contain stale snapshots that would clobber bin/ features.\n"
+              "  run dry-run first (tm-promote), inspect diffs, then apply named files.",
+              file=sys.stderr)
+        return 2
+
+    only = set(args.files) if args.files else None
+    changes = discover_changes(only)
+
+    if not changes:
+        print("✓ nothing to promote — workspace/bin matches bin/")
+        return 0
+
+    print(f"── promotion candidates ({len(changes)}) ──")
+    for c in changes:
+        reg = f"   {c['regression']}" if c["regression"] else ""
+        print(f"  [{c['status']:8s}] {c['name']}{reg}")
+
+    # Syntax-check every candidate FIRST (gate the whole batch).
+    print()
+    print("── syntax check ──")
+    failed = []
+    for c in changes:
+        ok, why = syntax_check(c["src"])
+        mark = "✓" if ok else "✗"
+        print(f"  {mark} {c['name']:30s} {why}")
+        if not ok:
+            failed.append(c["name"])
+    if failed:
+        print(f"\n✗ ABORT: {len(failed)} file(s) failed syntax check; not promoting any.",
+              file=sys.stderr)
+        return 1
+
+    if args.diff or not args.apply:
+        print()
+        print("── diff (head) ──")
+        for c in changes:
+            print(f"\n=== {c['name']} ({c['status']}) ===")
+            if c["status"] == "new":
+                lines = c["src"].read_text().splitlines()[:20]
+                for ln in lines:
+                    print(f"+ {ln}")
+                if len(lines) >= 20:
+                    print(f"... [more lines]")
+            else:
+                print(diff_short(c["dst"], c["src"]))
+
+    if not args.apply:
+        print()
+        print("Dry-run only. Re-run with --apply to copy files into bin/.")
+        return 0
+
+    # Backup + copy.
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+    bak = BAK_ROOT / ts
+    bak.mkdir(parents=True, exist_ok=True)
+    log = [f"# promotion {ts}"]
+
+    for c in changes:
+        if c["dst"].exists():
+            shutil.copy2(c["dst"], bak / c["name"])
+            log.append(f"backup: {c['name']} -> .promoted-bak/{ts}/{c['name']}")
+        shutil.copy2(c["src"], c["dst"])
+        # preserve exec bit if source had it
+        os.chmod(c["dst"], c["src"].stat().st_mode)
+        log.append(f"promote: workspace/bin/{c['name']} -> bin/{c['name']} ({c['status']})")
+        print(f"  ✓ promoted {c['name']} ({c['status']})")
+
+    (bak / "promotion.log").write_text("\n".join(log) + "\n")
+    print()
+    print(f"✓ promoted {len(changes)} file(s); backups in .promoted-bak/{ts}/")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

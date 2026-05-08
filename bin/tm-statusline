@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Claude Code statusLine: project name, plan progress, worker count, current task.
+
+Reads pm-state.json + plan.md. Stdout becomes the line at the bottom of Claude
+Code's interactive terminal UI. Should print one line, fast (<100ms).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def project_name() -> str:
+    plan = ROOT / "plan.md"
+    if not plan.exists():
+        return "(no plan)"
+    for raw in plan.read_text().splitlines():
+        line = raw.strip()
+        if not line.startswith("#"):
+            continue
+        # accept: "# Project: Foo", "# Project plan: Foo", "# Foo"
+        m = re.match(r"^#+\s*(?:Project(?:\s+plan)?\s*:\s*)?(.+?)\s*$", line)
+        if m and m.group(1):
+            return m.group(1).strip()
+    return "(unnamed)"
+
+
+def daemon_running() -> bool:
+    """Check both that the PID exists AND that it's actually our daemon.
+    PID-only checks lie when the OS recycles the PID to an unrelated process."""
+    pidfile = ROOT / "pm.pid"
+    if not pidfile.exists():
+        return False
+    try:
+        pid = int(pidfile.read_text().strip())
+    except Exception:
+        return False
+    try:
+        os.kill(pid, 0)
+    except Exception:
+        return False
+    # PID exists. Is it ours? Match the command line.
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except Exception:
+        return True  # can't verify; trust kill -0 result
+    return "pm-daemon.py" in out
+
+
+def read_state() -> dict | None:
+    state_file = ROOT / "pm-state.json"
+    if not state_file.exists():
+        return None
+    try:
+        return json.loads(state_file.read_text())
+    except Exception:
+        return None
+
+
+def truncate(s: str, n: int) -> str:
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def main() -> int:
+    # Drain the JSON Claude Code feeds us; we don't need its fields here.
+    if not sys.stdin.isatty():
+        try:
+            sys.stdin.read()
+        except Exception:
+            pass
+
+    GREEN = "\033[32m"; RED = "\033[31m"; GREY = "\033[90m"
+    CYAN  = "\033[36m"; YEL = "\033[33m"; MAG = "\033[35m"
+    DIM   = "\033[2m";  RST = "\033[0m"; BOLD = "\033[1m"
+
+    proj = project_name()
+    running = daemon_running()
+    s = read_state() or {}
+    tasks = s.get("tasks", []) or []
+    workers = s.get("workers", {}) or {}
+
+    n_total = len(tasks)
+    n_done  = sum(1 for t in tasks if t["status"] == "done")
+    n_inpg  = sum(1 for t in tasks if t["status"] == "in-progress")
+    n_fail  = sum(1 for t in tasks if t["status"] == "failed")
+    n_todo  = n_total - n_done - n_inpg - n_fail
+
+    n_busy = sum(1 for w in workers.values() if w.get("status") == "busy")
+    n_idle = sum(1 for w in workers.values() if w.get("status") == "idle")
+    n_other= sum(1 for w in workers.values() if w.get("status") not in ("busy","idle"))
+
+    current = next((t["title"] for t in tasks if t["status"] == "in-progress"), None)
+
+    dot = f"{GREEN}●{RST}" if running else f"{GREY}○{RST}"
+
+    progress_color = GREEN if n_done == n_total and n_total > 0 else CYAN
+    fail_part = f" · {RED}{n_fail} failed{RST}" if n_fail else ""
+
+    parts = [
+        f"{dot} {BOLD}{proj}{RST}",
+        f"📋 {progress_color}{n_done}/{n_total}{RST} done · {YEL}{n_inpg}{RST} live · {n_todo} todo{fail_part}",
+        f"👥 {n_busy + n_idle + n_other} ({n_busy}b/{n_idle}i)",
+    ]
+    if current:
+        parts.append(f"{MAG}▶{RST} {DIM}{truncate(current, 60)}{RST}")
+    elif n_total and n_done == n_total:
+        parts.append(f"{GREEN}✓ all tasks complete{RST}")
+
+    print("  │  ".join(parts))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

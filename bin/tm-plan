@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Generate plan.md.
+#
+# Modes:
+#   tm-plan                    # build mode: from goal.md (project from scratch)
+#   tm-plan --optimize         # optimize mode: from manifest.json (improve existing workspace/)
+#   tm-plan --force            # overwrite existing plan.md
+#   tm-plan --optimize --force
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GOAL="$ROOT/goal.md"
+PLAN="$ROOT/plan.md"
+MANIFEST="$ROOT/manifest.json"
+
+mode="build"
+force=0
+for arg in "$@"; do
+  case "$arg" in
+    --optimize) mode="optimize" ;;
+    --force)    force=1 ;;
+    *) echo "tm-plan: unknown flag '$arg'" >&2; exit 1 ;;
+  esac
+done
+
+if [ -f "$PLAN" ] && [ "$force" -eq 0 ]; then
+  echo "plan.md already exists. Use --force to regenerate." >&2
+  exit 1
+fi
+
+if ! command -v claude >/dev/null; then
+  echo "tm-plan: 'claude' CLI not found in PATH" >&2
+  exit 2
+fi
+
+if [ "$mode" = "optimize" ]; then
+  if [ ! -f "$MANIFEST" ]; then
+    echo "tm-plan --optimize: manifest.json not found. Run 'tm-profile' first." >&2
+    exit 3
+  fi
+  MANIFEST_TXT=$(cat "$MANIFEST")
+
+  prompt="You are a tech lead turning an audit MANIFEST into an improvement plan.
+
+The MANIFEST below identifies project-specific quality dimensions. Each has a current_state observation and a satisfied flag. Your job: emit a plan.md with concrete improvement tasks targeting EACH unsatisfied dimension.
+
+MANIFEST:
+---
+$MANIFEST_TXT
+---
+
+OUTPUT FORMAT (no preamble, no fences, no trailing prose):
+
+# Project: <2-5 word project name based on manifest.project_kind>
+
+<one short paragraph: what we're improving and how progress is measured>
+
+1. <imperative one-line task title — say what to change concretely>
+   signal_cmd: <copy the dimension's signal_cmd verbatim, or a strict refinement>
+2. <next task>
+   signal_cmd: <command>
+...
+
+REQUIREMENTS:
+- One task per UNSATISFIED dimension. Skip satisfied ones.
+- Task title must be a concrete code change instruction (e.g. 'Add cmd_delete subcommand to app.py with arg id'), NOT a vague goal ('Improve UX').
+- signal_cmd MUST exit 0 only when the change is actually in place. Re-use the manifest's signal_cmd unless you have a strict refinement.
+- Tasks operate in workspace/. The signal_cmd will be run with workspace/ as cwd.
+- Tasks should be sequential. Don't re-order such that a later task's signal_cmd would have passed already at task #1.
+- Don't include meta-tasks (plan, review, retro). Don't include refactors that aren't tied to a manifest dimension.
+
+Output the plan.md now:"
+  TMPSRC="$MANIFEST"
+else
+  if [ ! -f "$GOAL" ]; then
+    cat >&2 <<EOF
+no goal.md at $GOAL.
+Write one describing your project goal in plain language, then re-run tm-plan.
+EOF
+    exit 1
+  fi
+  GOAL_CONTENT=$(cat "$GOAL")
+  prompt="You are a tech lead breaking a software goal into a concrete plan.
+
+PROJECT GOAL:
+---
+$GOAL_CONTENT
+---
+
+Output ONLY the plan.md content in this exact format (no preamble, no codeblock fences):
+
+# Project: <2-5 word project name>
+
+<one short paragraph of context>
+
+1. <First task — concrete, single-purpose, verifiable>
+   signal_cmd: <optional shell command run from workspace/ that exits 0 when the task is done>
+2. <Next task>
+...
+
+REQUIREMENTS for tasks:
+- Each task is small enough for one Claude turn (~5-15 minutes of work).
+- Tasks must be sequential and unblocked.
+- Each task must produce a concrete artifact under workspace/.
+- 3-10 tasks total.
+- signal_cmd is optional but encouraged where verifiable. It is run with workspace/ as cwd. Exit 0 = task is done.
+- Don't include meta-tasks ('plan the project', 'review', 'set up environment').
+
+Output now:"
+  TMPSRC="$GOAL"
+fi
+
+echo "▸ asking claude to generate plan ($mode mode) …" >&2
+claude -p "$prompt" > "$PLAN.tmp"
+
+python3 - "$PLAN.tmp" "$PLAN" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src) as f:
+    txt = f.read()
+lines = txt.strip().splitlines()
+while lines and lines[0].lstrip().startswith("```"):
+    lines = lines[1:]
+while lines and lines[-1].lstrip().startswith("```"):
+    lines = lines[:-1]
+with open(dst, "w") as f:
+    f.write("\n".join(lines).rstrip() + "\n")
+PY
+rm -f "$PLAN.tmp"
+
+echo "✓ wrote $PLAN" >&2
+echo >&2
+echo "── preview ──" >&2
+sed -n '1,40p' "$PLAN" >&2

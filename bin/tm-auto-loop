@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Headless one-worker loop. Spawns `claude -p` per task until plan complete.
+# Useful for unattended runs (CI, demos, self-optimization).
+#
+# Usage: tm-auto-loop [--max-iters N]
+#
+# Each iteration:
+#   1. wait for tasks/<sid>.task to appear (PM has assigned next task)
+#   2. spawn `claude -p` with the task body as prompt
+#   3. that agent runs the task and calls `tm-done` (TM_AUTO=1 → no blocking)
+#   4. loop until all tasks are done or failed, or max iterations hit.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MAX_ITERS=${MAX_ITERS:-20}
+[ "${1:-}" = "--max-iters" ] && { MAX_ITERS="$2"; shift 2; }
+
+if ! command -v claude >/dev/null; then
+  echo "tm-auto-loop: claude CLI not found" >&2
+  exit 2
+fi
+
+SID="auto-$(date +%s)"
+echo "$SID" > "$ROOT/.session-id"
+LOG="$ROOT/auto-loop.log"
+: > "$LOG"
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+ev="$ROOT/events/${mid}_join_${SID}.json"
+python3 - "$SID" "$ts" > "$ev.tmp" <<'PY'
+import json, sys
+sid, ts = sys.argv[1], sys.argv[2]
+print(json.dumps({"ts": ts, "type": "join", "session_id": sid, "data": {}}))
+PY
+mv "$ev.tmp" "$ev"
+echo "▸ auto-loop joined as $SID" | tee -a "$LOG"
+
+plan_done() {
+  python3 - "$ROOT/pm-state.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if s["tasks"] and all(t["status"] in ("done","failed") for t in s["tasks"]) else 1)
+PY
+}
+
+is_stale() {
+  python3 - "$ROOT/pm-state.json" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+w = s.get("workers", {}).get(sys.argv[2])
+sys.exit(0 if w and w.get("status") in ("stale","left") else 1)
+PY
+}
+
+send_rejoin() {
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  mid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+  ev="$ROOT/events/${mid}_join_${SID}.json"
+  python3 - "$SID" "$ts" > "$ev.tmp" <<'PY'
+import json, sys
+sid, ts = sys.argv[1], sys.argv[2]
+print(json.dumps({"ts": ts, "type": "join", "session_id": sid, "data": {"reason":"re-join"}}))
+PY
+  mv "$ev.tmp" "$ev"
+  echo "▸ sent re-join (was marked stale/left)" | tee -a "$LOG"
+}
+
+iter=0
+while [ "$iter" -lt "$MAX_ITERS" ]; do
+  if plan_done; then
+    echo "🎉 plan complete at iter=$iter" | tee -a "$LOG"
+    exit 0
+  fi
+
+  TASK="$ROOT/tasks/$SID.task"
+  if [ ! -f "$TASK" ]; then
+    if is_stale "$SID"; then
+      send_rejoin
+    fi
+    sleep 0.5
+    continue
+  fi
+
+  iter=$((iter+1))
+  task_body=$(cat "$TASK")
+  rm -f "$TASK"
+
+  echo | tee -a "$LOG"
+  echo "═══ iter $iter ═══" | tee -a "$LOG"
+  echo "$task_body" | tee -a "$LOG"
+
+  prompt="You are an autonomous worker session. Do EXACTLY this one task and nothing else, then call tm-done.
+
+$task_body
+
+Rules:
+- Edit files in workspace/ only. Don't modify bin/, plan.md, manifest.json, goal.md, CLAUDE.md, .claude/, or any PM infrastructure.
+- If a signal_cmd is listed, the harness will run it after you call tm-done. The task is only accepted when signal_cmd exits 0.
+- After making your edits, run \`tm-done \"<one-line summary>\"\`. Don't summarize, don't explain, just call it.
+- Don't ask the user any questions. Pick the most defensible interpretation.
+- You have Read, Write, Edit, Bash, Grep, Glob."
+
+  TM_AUTO=1 PATH="$ROOT/bin:$PATH" claude -p \
+    --allowedTools "Read,Write,Edit,Bash,Grep,Glob" \
+    --append-system-prompt "TM_AUTO mode: minimize prose. Use tools. Always end by calling tm-done." \
+    "$prompt" >>"$LOG" 2>&1 || echo "(claude -p exited non-zero — see $LOG)" | tee -a "$LOG"
+
+  # Give PM a moment to process the done/signal_failed event.
+  sleep 0.8
+done
+
+echo "✗ hit MAX_ITERS=$MAX_ITERS without completion" | tee -a "$LOG"
+exit 1

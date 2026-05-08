@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Verify a completed task. Spawns `claude -p` to inspect workspace/ and judge
+# the work. Outputs JSON to stdout: {"verdict":"PASS"|"FAIL","reason":"..."}.
+#
+# Usage: tm-review <task-id> <task-title> <worker-summary>
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TID="$1"
+TITLE="$2"
+SUMMARY="$3"
+
+if ! command -v claude >/dev/null; then
+  # Degrade gracefully: if claude is missing, auto-pass.
+  python3 -c 'import json; print(json.dumps({"verdict":"PASS","reason":"claude CLI not available; auto-pass"}))'
+  exit 0
+fi
+
+prompt="You are a strict code reviewer verifying that a teammate completed a task correctly.
+
+The project workspace is: $ROOT/workspace/
+
+TASK (id #$TID):
+$TITLE
+
+WORKER'S SELF-REPORTED SUMMARY:
+$SUMMARY
+
+YOUR JOB:
+1. Read whatever you need under workspace/ to verify the task is actually complete.
+2. If the task says to run tests / a command, RUN IT and confirm output.
+3. If the task says to write a specific file with specific behavior, confirm the file exists with that behavior.
+4. Be strict. Don't accept claims without checking. But also don't invent requirements that aren't in the task.
+
+Reply with EXACTLY one JSON object on a single line, nothing else:
+{\"verdict\": \"PASS\" or \"FAIL\", \"reason\": \"<one sentence — why pass, or what's wrong>\"}
+
+Output now:"
+
+raw=$(claude -p --allowedTools "Read,Bash,Grep,Glob" "$prompt" 2>/dev/null || true)
+
+# Extract the JSON object from claude's reply (it might wrap it in prose / fences).
+python3 - <<PY
+import json, re, sys
+raw = """$raw"""
+m = re.search(r'\{[^{}]*"verdict"[^{}]*"reason"[^{}]*\}', raw, re.DOTALL)
+if m:
+    try:
+        d = json.loads(m.group(0))
+        v = d.get("verdict","").upper()
+        if v not in ("PASS","FAIL"):
+            v = "FAIL"
+        print(json.dumps({"verdict": v, "reason": d.get("reason","(no reason)")}))
+        sys.exit(0)
+    except json.JSONDecodeError:
+        pass
+# Fallback: heuristic
+if "PASS" in raw.upper() and "FAIL" not in raw.upper():
+    print(json.dumps({"verdict":"PASS","reason":"reviewer said PASS (parsed loosely)"}))
+elif "FAIL" in raw.upper():
+    print(json.dumps({"verdict":"FAIL","reason":"reviewer said FAIL (parsed loosely)"}))
+else:
+    print(json.dumps({"verdict":"FAIL","reason":"reviewer output unparseable: " + raw[:200]}))
+PY

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Wire claude-team-demo to optimize ITSELF safely.
+#
+# Effect:
+#   - copies the host project to ../claude-team-demo-target/ (fresh copy each run)
+#   - replaces host's workspace/ with a symlink → that target
+#   - writes a self-improvement goal.md
+#   - leaves you ready to run: tm-pm reset, tm-profile, tm-plan --optimize, ...
+#
+# Why a separate copy: workers under PM control will edit files under
+# workspace/. If workspace/ pointed at the same checkout that's running the
+# daemon, a worker editing bin/pm-daemon.py would crash the live daemon
+# mid-iteration. The copy is the test patient; the host is the surgeon.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PARENT="$(dirname "$HERE")"
+TARGET="${SELF_OPT_TARGET:-$PARENT/claude-team-demo-target}"
+
+echo "▸ stopping any running daemon"
+"$HERE/bin/tm-pm" stop >/dev/null 2>&1 || true
+
+if [ -d "$TARGET" ]; then
+  echo "▸ removing previous target $TARGET"
+  rm -rf "$TARGET"
+fi
+
+echo "▸ copying $HERE → $TARGET (the optimization subject)"
+mkdir -p "$TARGET"
+
+# Copy everything except runtime state and prior optimization artifacts.
+EXCLUDES=(
+  --exclude=.git --exclude=.DS_Store --exclude=.teamagent
+  --exclude=workspace --exclude='workspace.bak.*'
+  --exclude=events --exclude=tasks --exclude=nags
+  --exclude=pm-state.json --exclude=pm.log --exclude=pm.pid
+  --exclude=manifest.json --exclude=plan.md --exclude=goal.md
+  --exclude=auto-loop.console --exclude=auto-loop.log
+  --exclude=.session-id --exclude=.auto-loop.pid
+)
+if command -v rsync >/dev/null; then
+  rsync -a "${EXCLUDES[@]}" "$HERE/" "$TARGET/"
+else
+  ( cd "$HERE" && tar -cf - \
+      --exclude=.git --exclude=.DS_Store --exclude=.teamagent \
+      --exclude=workspace --exclude='workspace.bak.*' \
+      --exclude=events --exclude=tasks --exclude=nags \
+      --exclude=pm-state.json --exclude=pm.log --exclude=pm.pid \
+      --exclude=manifest.json --exclude=plan.md --exclude=goal.md \
+      --exclude=auto-loop.console --exclude=auto-loop.log \
+      --exclude=.session-id --exclude=.auto-loop.pid \
+      . ) | ( cd "$TARGET" && tar -xf - )
+fi
+
+# Empty runtime dirs in the target so the profiler doesn't see leftover state.
+mkdir -p "$TARGET/events" "$TARGET/tasks" "$TARGET/nags" "$TARGET/workspace"
+
+echo "▸ pointing host workspace/ → $TARGET"
+if [ -L "$HERE/workspace" ]; then
+  rm "$HERE/workspace"
+elif [ -d "$HERE/workspace" ]; then
+  ts=$(date +%s)
+  mv "$HERE/workspace" "$HERE/workspace.bak.$ts"
+  echo "  (moved old workspace/ to workspace.bak.$ts)"
+fi
+ln -s "$TARGET" "$HERE/workspace"
+
+# Reset PM-owned state on the host.
+"$HERE/bin/tm-pm" reset >/dev/null
+
+# Replace plan/manifest/goal in the host so we start fresh against the new target.
+rm -f "$HERE/manifest.json" "$HERE/plan.md"
+
+echo "▸ writing self-optimize goal.md"
+cat > "$HERE/goal.md" <<'EOF'
+# Project goal: optimize claude-team-demo
+
+The codebase under `workspace/` IS a fresh copy of THIS project (claude-team-demo, a multi-agent CLI org built on Claude Code). Improve it on these axes — without breaking existing scripts or changing externally visible behavior:
+
+- **Shell-injection robustness**: scripts under `bin/` must handle task titles, signal output, and worker summaries that contain backticks, single/double quotes, and dollar signs without writing malformed event JSON.
+- **Atomic event writes**: every script that produces an `events/*.json` file must write to `*.json.tmp` and rename atomically; the daemon must skip `.tmp` files (already true). Verify this property with a focused test.
+- **Daemon resilience**: `bin/pm-daemon.py` should never crash on bad input. Bad event files are logged and skipped (already true). Add coverage so a regression would fail a test.
+- **Unit tests**: introduce a `tests/` directory in workspace/ with pytest-runnable unit tests for: `parse_plan()` (numbered, bulleted, signal_cmd lines, continuation lines, blank-line separators), and the event-file atomicity property.
+- **`tm-pm status` exit code**: it should exit 0 when the daemon completed naturally (`pm-state.json` exists with all tasks done) even if the process is no longer running. Today it returns 1 in that case.
+- **Documentation accuracy**: `README.md` must describe the strict-mode review loop and the `signal_cmd` flow correctly. The `--auto` flag in `start-demo.sh` is documented; verify the exact behavior matches.
+
+Constraints:
+- Don't introduce external Python or shell dependencies.
+- Don't modify `goal.md`, `plan.md`, or `manifest.json` — those are PM inputs, not target code.
+- Each `bin/*` script must still pass `bash -n` after edits.
+- The pytest suite (the new one in `tests/`) must run cleanly with `python3 -m pytest -q tests/`.
+EOF
+
+cat <<EOF
+
+✓ ready. host = $HERE,  target = $TARGET
+
+next steps (run from $HERE):
+  ./bin/tm-profile                 # claude reads workspace/ (= the target copy) → manifest.json
+  ./bin/tm-plan --optimize         # manifest → plan.md (with signal_cmds per dimension)
+  ./bin/tm-pm start                # daemon comes up
+
+then EITHER (new terminal window):
+  cd $HERE && claude               # interactive worker, type 'go' once
+OR (headless, this terminal):
+  ./bin/tm-auto-loop --max-iters 12
+
+after the run, diff to see what changed:
+  diff -ru "$HERE" "$TARGET" \\
+    --exclude=.git --exclude=workspace --exclude=events --exclude=tasks \\
+    --exclude=nags --exclude=pm-state.json --exclude=pm.log --exclude=manifest.json \\
+    --exclude=plan.md --exclude=goal.md --exclude=auto-loop.console --exclude=auto-loop.log
+EOF

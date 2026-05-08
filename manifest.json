@@ -1,0 +1,61 @@
+{
+  "project_kind": "Bash + Python multi-agent CLI orchestrator (PM daemon, workers, hooks, strict review loop) with file-based event passing under workspace/.",
+  "dimensions": [
+    {
+      "name": "shell_injection_robustness",
+      "why": "Worker summaries, signal_cmd output tails, and session ids flow into JSON event files via shell; if those values are interpolated into here-docs they corrupt the JSON when they contain quotes, backticks, or $.",
+      "what_to_audit": "Every script that writes an events/*.json file should pass user-controlled strings to python via positional argv (sys.argv) rather than embedding them in the heredoc body.",
+      "signal_cmd": "grep -q sys.argv bin/tm-done && grep -q sys.argv bin/tm-session-hook && grep -q sys.argv bin/tm-auto-loop",
+      "current_state": "tm-done, tm-session-hook, and tm-auto-loop all pass values via positional argv to a `python3 - \"$VAR\" ...` invocation with a quoted-heredoc body, which is shell-injection safe.",
+      "satisfied": true
+    },
+    {
+      "name": "atomic_event_writes",
+      "why": "The PM daemon scans events/ on a 0.25s tick; a partially-written *.json would be parsed and rejected as bad event. Writing to *.tmp and renaming guarantees the daemon only ever sees complete files.",
+      "what_to_audit": "Every script that creates events/*.json must write the JSON to a *.tmp sibling and then rename it into place atomically.",
+      "signal_cmd": "grep -q 'ev_file.tmp' bin/tm-done && grep -q 'ev.tmp' bin/tm-session-hook && grep -q 'ev.tmp' bin/tm-auto-loop && grep -q 'mv ' bin/tm-done && grep -q 'mv ' bin/tm-session-hook && grep -q 'mv ' bin/tm-auto-loop",
+      "current_state": "All three event-producing scripts redirect into *.tmp and then `mv` into the final *.json filename.",
+      "satisfied": true
+    },
+    {
+      "name": "daemon_resilience",
+      "why": "pm-daemon.py is a long-running background process; a single malformed event or a *.tmp file caught mid-rename must not crash it, otherwise the whole project stalls silently.",
+      "what_to_audit": "process_events must skip *.tmp staging files and must catch json.loads failures, log them, and unlink the bad file rather than raising.",
+      "signal_cmd": "grep -q 'endswith' bin/pm-daemon.py && grep -q 'BAD EVENT' bin/pm-daemon.py",
+      "current_state": "pm-daemon.py filters out *.tmp files in process_events and wraps json.loads in a try/except that logs `BAD EVENT` and unlinks the file.",
+      "satisfied": true
+    },
+    {
+      "name": "unit_tests_for_parse_plan_and_atomicity",
+      "why": "parse_plan() is the single biggest piece of pure logic in the daemon and the atomic-rename property is invisible until it regresses; only an executable test prevents drift.",
+      "what_to_audit": "A tests/ directory under workspace/ with pytest tests that exercise parse_plan() (numbered, bulleted, signal_cmd, continuation, blank-line separators) and the *.tmp-skip / atomic-rename property of the events pipeline.",
+      "signal_cmd": "python3 -m pytest -q tests/",
+      "current_state": "tests/ exists with test_parse_plan.py, test_event_atomicity.py, and test_tm_pm_status.py; all 14 tests pass.",
+      "satisfied": true
+    },
+    {
+      "name": "tm_pm_status_exit_zero_on_natural_completion",
+      "why": "When the daemon exits cleanly because every task is done, automation that polls `tm-pm status` should treat that as success (exit 0); previously it conflated 'process not running' with failure and returned 1, breaking CI scripts and the auto-loop.",
+      "what_to_audit": "tm-pm status should exit 0 when pm-state.json exists and all tasks are in a terminal state (done / failed), even if the pid file is gone or the process is no longer running.",
+      "signal_cmd": "python3 -m pytest -q tests/test_tm_pm_status.py",
+      "current_state": "tm-pm computes an `all_terminal` flag and only exits 1 when the daemon is down AND outstanding work remains; all three regression tests pass.",
+      "satisfied": true
+    },
+    {
+      "name": "readme_documents_signal_cmd_and_strict_loop",
+      "why": "signal_cmd is a first-class part of the task grammar (parsed by pm-daemon, executed by tm-done, retried up to MAX_SIGNAL times) and the strict review loop is the project's main quality gate; if README omits them, contributors can't reason about how a task is judged.",
+      "what_to_audit": "README.md must mention signal_cmd and describe the strict-mode review loop with retries.",
+      "signal_cmd": "grep -q signal_cmd README.md && grep -qi strict README.md",
+      "current_state": "README.md has a 'Task grammar' section describing signal_cmd parsing/execution/retries and a 'Strict mode and the review loop' section covering MAX_RETRIES.",
+      "satisfied": true
+    },
+    {
+      "name": "bash_syntax_clean",
+      "why": "These shell scripts are the worker's tool surface; a syntax error in any one of them silently breaks the loop on the next invocation. `bash -n` is the cheapest possible regression guard.",
+      "what_to_audit": "Every bash script in bin/ and start-demo.sh parses cleanly under `bash -n`.",
+      "signal_cmd": "for f in start-demo.sh bin/tm-auto-loop bin/tm-done bin/tm-plan bin/tm-pm bin/tm-profile bin/tm-prompt-hook bin/tm-review bin/tm-session-hook bin/tm-stop-hook; do bash -n \"$f\" || exit 1; done",
+      "current_state": "All ten bash scripts parse cleanly under `bash -n`.",
+      "satisfied": true
+    }
+  ]
+}

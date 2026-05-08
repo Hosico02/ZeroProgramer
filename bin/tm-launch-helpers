@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Spawn helper agent windows alongside an existing supervisor.
+#
+# Opens N+1 new Terminal.app windows on macOS:
+#   1 × planner   (./bin/tm-claude-planner)
+#   N × executor  (claude with default role)
+#
+# Each new window runs `cd <project>` first, so the .claude/settings.json
+# hooks fire and the new session registers with PM in the right role.
+#
+# Usage:
+#   tm-launch-helpers          # 1 planner + 1 executor
+#   tm-launch-helpers 2        # 1 planner + 2 executors
+#   tm-launch-helpers 0        # planner only (no executor)
+#
+# Falls back to printing manual commands if osascript / Terminal.app are
+# unavailable (e.g. running over SSH or in a non-mac shell).
+set -euo pipefail
+
+N_EXECUTORS="${1:-1}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Single-quote escape ROOT for embedding in osascript do-script string.
+ROOT_Q="${ROOT//\'/\'\\\'\'}"
+
+have_osascript() {
+  command -v osascript >/dev/null 2>&1
+}
+
+spawn_terminal_window() {
+  local cmd="$1"
+  # macOS Terminal.app: do script always opens a new window (or new tab if
+  # using `tab of front window`, but window is the simpler default).
+  osascript -e "tell application \"Terminal\" to do script \"cd '${ROOT_Q}' && ${cmd}\"" >/dev/null
+}
+
+if ! have_osascript; then
+  echo "tm-launch-helpers: osascript not available — please open these manually:" >&2
+  echo "  cd '$ROOT' && ./bin/tm-claude-planner" >&2
+  for i in $(seq 1 "$N_EXECUTORS"); do
+    echo "  cd '$ROOT' && ./bin/tm-claude-executor    # executor #$i" >&2
+  done
+  exit 1
+fi
+
+# 1 planner — wrapper auto-submits "go"
+echo "▸ spawning planner window…"
+spawn_terminal_window "./bin/tm-claude-planner"
+
+# N executors — wrapper auto-submits "go"
+for i in $(seq 1 "$N_EXECUTORS"); do
+  echo "▸ spawning executor #$i window…"
+  spawn_terminal_window "./bin/tm-claude-executor"
+  # tiny stagger to reduce SessionStart hook contention
+  sleep 0.3
+done
+
+echo
+echo "✓ launched 1 planner + $N_EXECUTORS executor(s). Each window auto-submits 'go'; agents start working without input."

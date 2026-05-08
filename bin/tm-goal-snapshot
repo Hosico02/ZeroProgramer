@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# tm-goal-snapshot — copy the current goal.md into goal-history/<iso>.md
+# before any agent edits goal.md.
+#
+# Used by tm-supervise revise-goal as a safety step (so the prior goal
+# is never lost), but also callable standalone before manual edits.
+#
+# Usage:
+#   tm-goal-snapshot                # snapshot goal.md to goal-history/<iso>.md
+#   tm-goal-snapshot list           # list existing snapshots, newest first
+#   tm-goal-snapshot diff [N]       # diff goal.md vs snapshot N (default: latest)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GOAL="$ROOT/goal.md"
+HIST="$ROOT/goal-history"
+
+case "${1:-}" in
+  ""|snapshot)
+    if [ ! -f "$GOAL" ]; then
+      echo "tm-goal-snapshot: $GOAL not found" >&2
+      exit 1
+    fi
+    mkdir -p "$HIST"
+    ts=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+    out="$HIST/$ts.md"
+    cp "$GOAL" "$out"
+    # also stamp the snapshot with metadata at top
+    {
+      echo "<!-- snapshot taken $ts by ${USER:-?} on $(hostname -s 2>/dev/null || echo ?) -->"
+      cat "$GOAL"
+    } > "$out.tmp" && mv "$out.tmp" "$out"
+    echo "✓ goal.md snapshotted: goal-history/$ts.md"
+    echo "$out"
+    ;;
+
+  list)
+    if [ ! -d "$HIST" ] || [ -z "$(ls -A "$HIST" 2>/dev/null)" ]; then
+      echo "(no snapshots yet)"
+      exit 0
+    fi
+    ls -t "$HIST" | sed 's|^|  |'
+    ;;
+
+  diff)
+    n="${2:-1}"
+    if [ ! -d "$HIST" ]; then
+      echo "(no snapshots yet)" >&2; exit 1
+    fi
+    files=$(ls -t "$HIST"/*.md 2>/dev/null)
+    snap=$(echo "$files" | sed -n "${n}p")
+    if [ -z "$snap" ]; then
+      echo "tm-goal-snapshot: snapshot #$n not found" >&2; exit 1
+    fi
+    echo "── diff: snapshot $(basename "$snap") vs current goal.md ──"
+    diff -u "$snap" "$GOAL" || true
+    ;;
+
+  -h|--help)
+    sed -n '2,11p' "$0" | sed 's/^# \?//'
+    ;;
+
+  *)
+    echo "tm-goal-snapshot: unknown subcommand '$1'" >&2
+    echo "Usage: tm-goal-snapshot {snapshot|list|diff [N]}" >&2
+    exit 1
+    ;;
+esac

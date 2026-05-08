@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Control the PM daemon.
+# Usage: tm-pm {start|stop|status|log [N]|reset|tail|gc|escalations|shutdown [reason]|watch [interval]}
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PIDFILE="$ROOT/pm.pid"
+LOG="$ROOT/pm.log"
+DAEMON="$ROOT/bin/pm-daemon.py"
+
+is_running() {
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+case "${1:-}" in
+  start)
+    shift
+    extra_env=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --iterate) extra_env="$extra_env PM_ITERATE=1" ;;
+        --assess)  extra_env="$extra_env PM_ASSESS=1" ;;
+        --goal-review) extra_env="$extra_env PM_GOAL_REVIEW=1" ;;
+        --forever) extra_env="$extra_env PM_FOREVER=1" ;;
+        --strict)  extra_env="$extra_env PM_STRICT=1" ;;
+        --quiet-streak=*)    extra_env="$extra_env PM_QUIET_STREAK=${1#*=}" ;;
+        --max-outer=*)       extra_env="$extra_env PM_MAX_OUTER_ITERS=${1#*=}" ;;
+        --max-assess=*)      extra_env="$extra_env PM_MAX_ASSESSMENTS=${1#*=}" ;;
+        *) echo "tm-pm start: unknown flag '$1'" >&2; exit 1 ;;
+      esac
+      shift
+    done
+    if is_running; then
+      echo "PM already running (pid $(cat "$PIDFILE"))"
+      exit 0
+    fi
+    : > "$LOG"
+    # shellcheck disable=SC2086
+    env $extra_env nohup python3 "$DAEMON" >> "$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 0.4
+    if is_running; then
+      echo "✓ PM started (pid $(cat "$PIDFILE"))  log: $LOG"
+      [ -n "$extra_env" ] && echo "  env: $extra_env"
+    else
+      echo "✗ PM failed to start. last log lines:" >&2
+      tail -n 20 "$LOG" >&2 || true
+      exit 1
+    fi
+    ;;
+
+  stop)
+    if is_running; then
+      kill "$(cat "$PIDFILE")" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$(cat "$PIDFILE")" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+    echo "✓ PM stopped"
+    ;;
+
+  status)
+    if is_running; then
+      echo "✓ running (pid $(cat "$PIDFILE"))"
+    else
+      echo "✗ not running"
+      exit 1
+    fi
+    if [ -f "$ROOT/pm-state.json" ]; then
+      python3 - "$ROOT/pm-state.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+total = len(s["tasks"])
+done  = sum(1 for t in s["tasks"] if t["status"] == "done")
+inpg  = sum(1 for t in s["tasks"] if t["status"] == "in-progress")
+todo  = total - done - inpg
+print(f"  tasks: {done}/{total} done, {inpg} in-progress, {todo} todo")
+print(f"  workers ({len(s['workers'])}):")
+for sid, w in s["workers"].items():
+    sid_short = sid[:12] if sid != "unknown" else sid
+    cur = w.get("current_task_id")
+    cur_s = f"task #{cur}" if cur else "—"
+    role = w.get("role", "executor")
+    print(f"    {sid_short:14s} {role:8s} {w['status']:8s} {cur_s}")
+print()
+print("  current plan:")
+for t in s["tasks"]:
+    mark = {"done":"✓", "in-progress":"▶", "todo":"·"}.get(t["status"], "?")
+    extra = ""
+    if t.get("summary"):
+        extra = f"   ↳ {t['summary']}"
+    print(f"    {mark} #{t['id']} {t['title']}{extra}")
+PY
+    fi
+    ;;
+
+  log)
+    n="${2:-50}"
+    tail -n "$n" "$LOG" 2>/dev/null || echo "(no log)"
+    ;;
+
+  tail)
+    exec tail -F "$LOG"
+    ;;
+
+  watch)
+    # Live dashboard. Clears screen and re-renders status + recent events
+    # every <interval> seconds (default 1s). Workaround for Claude Code's
+    # statusLine which only refreshes on agent turn boundaries — keep this
+    # in a separate terminal for true real-time visibility.
+    interval="${2:-1}"
+    trap 'printf "\033[?25h\n"; exit 0' INT TERM
+    printf '\033[?25l'   # hide cursor
+    while true; do
+      printf '\033[2J\033[H'    # clear screen + home cursor
+      printf '\033[1m── tm-pm watch  %s  refresh %ss  (Ctrl+C to exit)\033[0m\n\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$interval"
+      "$0" status 2>&1
+      echo
+      printf '\033[1m── recent events (last 12) ──\033[0m\n'
+      tail -n 12 "$LOG" 2>/dev/null || echo "(no log)"
+      echo
+      printf '\033[1m── escalations ──\033[0m\n'
+      "$0" escalations 2>&1 | head -8
+      sleep "$interval"
+    done
+    ;;
+
+  reset)
+    "$0" stop >/dev/null 2>&1 || true
+    "$ROOT/bin/tm-planner" stop >/dev/null 2>&1 || true
+    rm -rf "$ROOT/events" "$ROOT/tasks" "$ROOT/nags" "$ROOT/escalations"
+    rm -rf "$ROOT/goal-history" "$ROOT/bin/.promoted-bak"
+    rm -rf "$ROOT/status-reports" "$ROOT/decisions"
+    rm -f  "$ROOT/pm-state.json" "$ROOT/pm.log" "$ROOT/.session-id"
+    rm -f  "$ROOT/planner.log" "$ROOT/planner.pid" "$ROOT/supervisor.log"
+    mkdir -p "$ROOT/events" "$ROOT/tasks" "$ROOT/nags"
+    echo "✓ reset (events/, tasks/, nags/, escalations/, goal-history/, .promoted-bak/, status-reports/, decisions/, pm-state.json, pm.log, planner.log, supervisor.log, .session-id)"
+    ;;
+
+  shutdown)
+    # Cooperative shutdown — write a shutdown event and let pm-daemon honor it
+    # at the next tick (after draining whatever's still pending in events/).
+    shift
+    reason="${*:-tm-pm shutdown command}"
+    if ! is_running; then
+      echo "PM not running; nothing to shut down."
+      exit 0
+    fi
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    mid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+    ev="$ROOT/events/${mid}_shutdown_cli.json"
+    python3 - "$ts" "$reason" > "$ev.tmp" <<'PY'
+import json, sys
+ts, reason = sys.argv[1], sys.argv[2]
+print(json.dumps({"ts": ts, "type": "shutdown", "session_id": "cli", "data": {"reason": reason}}))
+PY
+    mv "$ev.tmp" "$ev"
+    echo "✓ shutdown event written; PM will exit on next tick."
+    ;;
+
+  escalations)
+    # List permanent-fail tasks and the breadcrumbs the daemon emitted.
+    if [ ! -d "$ROOT/escalations" ] || [ -z "$(ls -A "$ROOT/escalations" 2>/dev/null)" ]; then
+      echo "✓ no escalations"
+      exit 0
+    fi
+    count=0
+    for f in "$ROOT"/escalations/*.md; do
+      [ -e "$f" ] || continue
+      count=$((count + 1))
+      echo "── $(basename "$f") ──"
+      sed -n '1,8p' "$f"
+      echo
+    done
+    echo "($count escalation(s); full bodies in $ROOT/escalations/)"
+    ;;
+
+  gc)
+    # Drop stale/left workers from pm-state.json and clean their sidecar files.
+    # Safe to run whether the daemon is up or down — uses atomic rename.
+    python3 - "$ROOT" <<'PY'
+import json, os, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+state_p = root / "pm-state.json"
+if not state_p.exists():
+    print("(no pm-state.json — nothing to gc)"); sys.exit(0)
+s = json.loads(state_p.read_text())
+workers = s.get("workers", {})
+before = len(workers)
+gone = [sid for sid, w in workers.items() if w.get("status") in ("stale", "left")]
+for sid in gone:
+    for sub in (root/"tasks"/f"{sid}.task",
+                root/"tasks"/f"{sid}.signal",
+                root/"nags"/f"{sid}.nag"):
+        if sub.exists(): sub.unlink()
+    del workers[sid]
+tmp = state_p.with_suffix(".tmp")
+tmp.write_text(json.dumps(s, indent=2))
+tmp.replace(state_p)
+print(f"✓ gc: {before} → {len(workers)} workers (dropped {len(gone)})")
+PY
+    ;;
+
+  ""|-h|--help)
+    sed -n '2,3p' "$0"
+    ;;
+  *)
+    echo "tm-pm: unknown subcommand '$1'" >&2
+    sed -n '2,3p' "$0" >&2
+    exit 1
+    ;;
+esac

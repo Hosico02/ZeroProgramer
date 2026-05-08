@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# Planner CLI: emit one assessment decision (add_task or assess_clean), then
+# block until PM's todo queue drops below threshold so a fresh assessment
+# is warranted. Mirrors tm-done's emit-then-poll pattern, but for the
+# planner role.
+#
+# Usage:
+#   tm-plan-cycle add   "<task title>" ["<signal_cmd>"]
+#   tm-plan-cycle clean "<one-line reason>"
+#
+# Env:
+#   TM_PLAN_LOW_TODO         default 1.   Wake on add when todo < this.
+#   TM_PLAN_CLEAN_COOLDOWN   default 300. After 'clean' verdict, wait at least
+#                                         this many seconds before re-evaluating.
+#                                         Prevents the burn-token loop where
+#                                         queue=0 wakes Claude, Claude declares
+#                                         clean again, repeat. Wakes early if
+#                                         queue grows above PLAN_LOW_TODO.
+#   TM_AUTO=1                skip post-emit blocking (headless mode).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SID="${CLAUDE_CODE_SESSION_ID:-}"
+[ -z "$SID" ] && SID=$(cat "$ROOT/.session-id" 2>/dev/null || echo "unknown")
+
+STATE_FILE="$ROOT/pm-state.json"
+PID_FILE="$ROOT/pm.pid"
+PLAN_LOW_TODO="${TM_PLAN_LOW_TODO:-1}"
+CLEAN_COOLDOWN="${TM_PLAN_CLEAN_COOLDOWN:-300}"
+
+VERDICT="${1:-}"
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+
+# ── 1. Emit the verdict event ──
+case "${1:-}" in
+  add)
+    title="${2:-}"
+    [ -z "$title" ] && { echo "tm-plan-cycle add: missing title" >&2; exit 1; }
+    sig="${3:-}"
+    ev="$ROOT/events/${mid}_add-task_${SID}.json"
+    python3 - "$SID" "$ts" "$title" "$sig" > "$ev.tmp" <<'PY'
+import json, sys
+sid, ts, title, sig = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+data = {"title": title, "source": "planner-agent"}
+if sig:
+    data["signal_cmd"] = sig
+print(json.dumps({"ts": ts, "type": "add_task", "session_id": sid, "data": data}))
+PY
+    mv "$ev.tmp" "$ev"
+    echo "✓ added task: $title" >&2
+    [ -n "$sig" ] && echo "  signal_cmd: $sig" >&2
+    ;;
+  clean)
+    reason="${2:-}"
+    [ -z "$reason" ] && { echo "tm-plan-cycle clean: missing reason" >&2; exit 1; }
+    ev="$ROOT/events/${mid}_assess-clean_${SID}.json"
+    python3 - "$SID" "$ts" "$reason" > "$ev.tmp" <<'PY'
+import json, sys
+sid, ts, reason = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({"ts": ts, "type": "assess_clean", "session_id": sid, "data": {"reason": reason}}))
+PY
+    mv "$ev.tmp" "$ev"
+    echo "✓ declared clean: $reason" >&2
+    ;;
+  *)
+    cat >&2 <<EOF
+Usage: tm-plan-cycle add   "<title>" ["<signal_cmd>"]
+       tm-plan-cycle clean "<reason>"
+EOF
+    exit 1
+    ;;
+esac
+
+# ── 2. Headless mode: don't block ──
+if [ "${TM_AUTO:-0}" = "1" ]; then
+  exit 0
+fi
+
+# ── 3. Block until next assessment is warranted ──
+# Wake conditions depend on what we just emitted:
+#   add   → wake the moment queue drops below threshold (drain → re-plan).
+#   clean → wake either after CLEAN_COOLDOWN seconds OR if queue grows
+#           unexpectedly (someone else added work, e.g. supervisor or another
+#           planner). Prevents the "queue=0 → declare clean → unblock → declare
+#           clean" tight loop that burns LLM tokens for no semantic value.
+if [ "$VERDICT" = "clean" ]; then
+  echo "▸ clean declared. backing off ${CLEAN_COOLDOWN}s before next assessment "\
+"(or earlier if queue grows above $PLAN_LOW_TODO)…" >&2
+else
+  echo "▸ event written. waiting until todo queue drops below $PLAN_LOW_TODO before next assessment…" >&2
+fi
+
+start_ts=$(date +%s)
+ticks=0
+while true; do
+  ticks=$((ticks + 1))
+  now_ts=$(date +%s)
+  elapsed=$((now_ts - start_ts))
+
+  # Daemon dead → exit cleanly
+  if [ -f "$PID_FILE" ] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo
+    echo "⚠️ pm-daemon is no longer running. Planner loop ends."
+    exit 0
+  fi
+
+  if [ ! -f "$STATE_FILE" ]; then
+    sleep 1
+    continue
+  fi
+
+  todo_count=$(python3 - "$STATE_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    print(99); sys.exit(0)
+print(sum(1 for t in s["tasks"] if t["status"] == "todo"))
+PY
+)
+
+  # Wake decision
+  if [ "$VERDICT" = "clean" ]; then
+    if [ "$todo_count" -ge "$PLAN_LOW_TODO" ]; then
+      echo
+      echo "─── queue grew unexpectedly to $todo_count todo while planner was idle — re-assessing ───"
+      python3 - "$STATE_FILE" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+done = [t for t in s["tasks"] if t["status"] == "done"]
+fail = [t for t in s["tasks"] if t["status"] == "failed"]
+inpg = [t for t in s["tasks"] if t["status"] == "in-progress"]
+print(f"  state: {len(done)} done, {len(fail)} failed, {len(inpg)} in-progress, "
+      f"clean-streak {s.get('assess_clean_streak', 0)}")
+PY
+      echo
+      echo "Inspect workspace/ with Read/Bash/Grep, then call tm-plan-cycle add/clean."
+      exit 0
+    fi
+    if [ "$elapsed" -ge "$CLEAN_COOLDOWN" ]; then
+      echo
+      echo "─── ${CLEAN_COOLDOWN}s cooldown elapsed — re-checking goal vs workspace ───"
+      python3 - "$STATE_FILE" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+done = [t for t in s["tasks"] if t["status"] == "done"]
+fail = [t for t in s["tasks"] if t["status"] == "failed"]
+inpg = [t for t in s["tasks"] if t["status"] == "in-progress"]
+print(f"  state: {len(done)} done, {len(fail)} failed, {len(inpg)} in-progress, "
+      f"clean-streak {s.get('assess_clean_streak', 0)}")
+PY
+      echo
+      echo "Inspect workspace/ with Read/Bash/Grep, then call tm-plan-cycle add/clean."
+      exit 0
+    fi
+  elif [ "$todo_count" -lt "$PLAN_LOW_TODO" ]; then
+    echo
+    echo "─── PM queue is low ($todo_count todo) — time to assess again ───"
+    python3 - "$STATE_FILE" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+done = [t for t in s["tasks"] if t["status"] == "done"]
+fail = [t for t in s["tasks"] if t["status"] == "failed"]
+inpg = [t for t in s["tasks"] if t["status"] == "in-progress"]
+print(f"  state: {len(done)} done, {len(fail)} failed, {len(inpg)} in-progress, "
+      f"clean-streak {s.get('assess_clean_streak', 0)}")
+print(f"  recent dones (last 5):")
+for t in done[-5:]:
+    print(f"    #{t['id']} {t['title'][:80]}")
+    if t.get("summary"):
+        print(f"      ↳ {t['summary'][:120]}")
+if fail:
+    print(f"  failed (escalated):")
+    for t in fail[-5:]:
+        print(f"    #{t['id']} {t['title'][:80]}")
+PY
+    echo
+    echo "Inspect workspace/ with Read/Bash/Grep, then call tm-plan-cycle add/clean."
+    exit 0
+  fi
+
+  # Heartbeat every ~30s — both visible to user AND emitted to PM as a
+  # progress event so the planner doesn't get stale-GC'd while legitimately
+  # blocked (Claude itself is suspended during this poll, so no PostToolUse
+  # hook would fire to keep the worker alive).
+  if [ $((ticks % 30)) -eq 0 ]; then
+    if [ "$VERDICT" = "clean" ]; then
+      remaining=$((CLEAN_COOLDOWN - elapsed))
+      echo "  (clean cooldown: ${remaining}s remaining; queue=$todo_count todo)" >&2
+    else
+      echo "  (waiting; queue still has $todo_count todo)" >&2
+    fi
+    pts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    pmid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+    pev="$ROOT/events/${pmid}_progress_${SID}.json"
+    python3 - "$SID" "$pts" > "$pev.tmp" <<'PY'
+import json, sys
+sid, ts = sys.argv[1], sys.argv[2]
+print(json.dumps({"ts": ts, "type": "progress", "session_id": sid, "data": {"source": "planner-poll"}}))
+PY
+    mv "$pev.tmp" "$pev"
+  fi
+  sleep 1
+done

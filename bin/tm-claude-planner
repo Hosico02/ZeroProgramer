@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Spawn an interactive Claude session in PLANNER role with auto-go +
+# real-time status in the terminal title bar.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+TM_ROLE=planner "$ROOT/bin/tm-title-keeper" &
+keeper=$!
+
+if [ $# -eq 0 ]; then
+  set -- "go"
+fi
+env TM_ROLE=planner claude "$@"
+ec=$?
+kill "$keeper" 2>/dev/null
+exit "$ec"

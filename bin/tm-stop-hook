@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Claude Code Stop hook: if PM has queued a task or nag for this worker,
+# block stop and inject it so the agent keeps going.
+set -euo pipefail
+
+[ "${TM_AUTO:-0}" = "1" ] && exit 0
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+stdin_json=""
+[ ! -t 0 ] && stdin_json=$(cat || true)
+
+# One Python pass extracts both stop_hook_active and session_id from the JSON.
+parsed=$(printf '%s' "$stdin_json" | python3 -c '
+import sys, json
+try:
+    d = json.loads(sys.stdin.read() or "{}")
+    print(("true" if d.get("stop_hook_active") else "false") + "|" + d.get("session_id",""))
+except Exception:
+    print("false|")
+' 2>/dev/null || echo "false|")
+active="${parsed%%|*}"
+SID="${parsed#*|}"
+[ "$active" = "true" ] && exit 0
+[ -z "$SID" ] && SID="${CLAUDE_CODE_SESSION_ID:-}"
+[ -z "$SID" ] && SID=$(cat "$ROOT/.session-id" 2>/dev/null || echo "unknown")
+
+TASK="$ROOT/tasks/$SID.task"
+NAG="$ROOT/nags/$SID.nag"
+
+[ ! -f "$TASK" ] && [ ! -f "$NAG" ] && exit 0
+
+reason=""
+if [ -f "$TASK" ]; then
+  reason+="📥 PM assigned you a task. Do it, then run \`tm-done \"<summary>\"\` (which will block until the next task is ready)."$'\n\n'
+  reason+=$(cat "$TASK")
+  rm -f "$TASK"
+fi
+if [ -f "$NAG" ]; then
+  [ -n "$reason" ] && reason+=$'\n\n'
+  reason+=$(cat "$NAG")
+  rm -f "$NAG"
+fi
+
+export REASON="$reason"
+python3 - <<'PY'
+import json, os
+print(json.dumps({"decision": "block", "reason": os.environ["REASON"]}))
+PY

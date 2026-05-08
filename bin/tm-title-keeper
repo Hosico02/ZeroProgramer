@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# tm-title-keeper — write the current PM status into THIS terminal's window
+# title every 2 seconds. Designed to be backgrounded by the tm-claude-*
+# wrappers; exits on its own when the parent process dies.
+#
+# Why this exists: Claude Code's statusLine only refreshes on agent turn
+# boundaries (between user prompt and Claude reply). During multi-second
+# tool calls it's stale. Terminal window titles, by contrast, can be
+# updated any time via OSC 0 escape — which we do here, indepedently.
+#
+# Result: every Claude window shows real-time same project state in its
+# OWN title bar, regardless of what its agent is doing.
+#
+# Env:
+#   TM_TITLE_INTERVAL  default 2 (seconds between updates)
+#
+# Caveat: works in Terminal.app and iTerm. For tmux, requires
+#   set-option -g set-titles on
+# in your .tmux.conf to propagate.
+set -u
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INTERVAL="${TM_TITLE_INTERVAL:-2}"
+PARENT_PID="${PPID}"
+
+# Pick the right tty to write the escape sequence to. /dev/tty resolves
+# to the controlling terminal of the calling process — which is the
+# user's actual window even if our caller has redirected stdout.
+TTY="${TM_TITLE_TTY:-/dev/tty}"
+
+# Bail quickly if we can't write to the tty (e.g. no controlling terminal,
+# running over SSH without -t, etc.). Don't keep an infinite loop spamming.
+if ! printf '' > "$TTY" 2>/dev/null; then
+  exit 0
+fi
+
+while kill -0 "$PARENT_PID" 2>/dev/null; do
+  title=$("$ROOT/bin/tm-status-title" 2>/dev/null) || title="claude-team"
+  # OSC 0 (or 2) sets window title. \007 (BEL) terminates per xterm spec.
+  printf '\033]0;%s\007' "$title" > "$TTY" 2>/dev/null
+  sleep "$INTERVAL"
+done

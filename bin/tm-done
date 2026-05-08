@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Worker tells PM: I finished the current task. If a signal_cmd is attached
+# to the task, tm-done runs it FIRST — only on exit 0 do we send the done
+# event. On non-zero exit, we send a signal_failed event and PM re-queues the
+# task with the failure tail as feedback.
+#
+# Usage: tm-done "<one-line summary>"
+#
+# Env:
+#   TM_AUTO=1   — used by the headless auto-loop to skip post-done blocking
+#                 polling (the auto-loop itself drives the next task).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Prefer CLAUDE_CODE_SESSION_ID (per-window, set by Claude Code in the agent's
+# tool-execution env). Falls back to the legacy .session-id only for
+# single-window setups; multi-window operation MUST use the env var because
+# .session-id is last-writer-wins.
+SID="${CLAUDE_CODE_SESSION_ID:-}"
+[ -z "$SID" ] && SID=$(cat "$ROOT/.session-id" 2>/dev/null || echo "unknown")
+SUMMARY="${*:-(no summary)}"
+
+WORKSPACE="$ROOT/workspace"
+SIG_FILE="$ROOT/tasks/$SID.signal"
+TASK_FILE="$ROOT/tasks/$SID.task"
+NAG_FILE="$ROOT/nags/$SID.nag"
+STATE_FILE="$ROOT/pm-state.json"
+
+# Guard: if PM has no task assigned to this worker, bail out without writing
+# a spurious done event. (Without this, an idle Claude session that runs
+# tm-done — e.g. on Stop hook re-fire — burns an LLM round and pollutes
+# events/. PM would ignore the event anyway since current_task_id is None.)
+if [ -f "$STATE_FILE" ]; then
+  has_task=$(python3 - "$STATE_FILE" "$SID" 2>/dev/null <<'PY'
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    print("yes"); sys.exit(0)   # uncertain → don't block, proceed
+sid = sys.argv[2]
+w = s.get("workers", {}).get(sid) or {}
+print("yes" if w.get("current_task_id") is not None else "no")
+PY
+)
+  if [ "$has_task" = "no" ]; then
+    echo "tm-done: PM has no task assigned to this worker (sid=${SID:0:8}); skipping done event." >&2
+    exit 1
+  fi
+fi
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+
+# ── 1. Run signal_cmd if attached ──
+if [ -s "$SIG_FILE" ]; then
+  cmd=$(cat "$SIG_FILE")
+  echo "▸ running signal_cmd: $cmd" >&2
+  set +e
+  out=$(cd "$WORKSPACE" 2>/dev/null && bash -c "$cmd" 2>&1)
+  exit_code=$?
+  set -e
+
+  if [ $exit_code -ne 0 ]; then
+    tail_out=$(printf '%s\n' "$out" | tail -n 40)
+    echo "✗ signal_cmd exited $exit_code — reporting signal_failed" >&2
+    ev_file="$ROOT/events/${mid}_signal-failed_${SID}.json"
+    python3 - "$SID" "$ts" "$exit_code" "$tail_out" "$SUMMARY" > "$ev_file.tmp" <<'PY'
+import json, sys
+sid, ts, code, tail, summary = sys.argv[1:6]
+print(json.dumps({
+    "ts": ts, "type": "signal_failed", "session_id": sid,
+    "data": {
+        "exit_code": int(code),
+        "output_tail": tail,
+        "summary": summary,
+    },
+}))
+PY
+    mv "$ev_file.tmp" "$ev_file"
+    rm -f "$SIG_FILE"
+    echo "── signal output tail ──" >&2
+    printf '%s\n' "$tail_out" >&2
+    echo "── PM will re-queue this task with the above tail as feedback. ──" >&2
+    # Fall through to polling — PM will re-assign the same task with the failure context.
+  else
+    echo "✓ signal_cmd passed (exit 0)" >&2
+    rm -f "$SIG_FILE"
+    SUMMARY="$SUMMARY [signal: PASS]"
+    # Send the done event below.
+    ev_file="$ROOT/events/${mid}_done_${SID}.json"
+    python3 - "$SID" "$SUMMARY" "$ts" > "$ev_file.tmp" <<'PY'
+import json, sys
+sid, summary, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({
+    "ts": ts, "type": "done", "session_id": sid,
+    "data": {"summary": summary},
+}))
+PY
+    mv "$ev_file.tmp" "$ev_file"
+  fi
+else
+  # No signal cmd — straight done event.
+  ev_file="$ROOT/events/${mid}_done_${SID}.json"
+  python3 - "$SID" "$SUMMARY" "$ts" > "$ev_file.tmp" <<'PY'
+import json, sys
+sid, summary, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({
+    "ts": ts, "type": "done", "session_id": sid,
+    "data": {"summary": summary},
+}))
+PY
+  mv "$ev_file.tmp" "$ev_file"
+fi
+
+# ── 2. In auto mode, exit immediately. ──
+if [ "${TM_AUTO:-0}" = "1" ]; then
+  exit 0
+fi
+
+# ── 3. Interactive mode: block waiting for next task or completion. ──
+echo "✓ event written. waiting for next task..." >&2
+
+# Poll until: task file appears, plan is done (and not iterating), or daemon dies.
+PID_FILE="$ROOT/pm.pid"
+ticks=0
+while true; do
+  ticks=$((ticks + 1))
+
+  if [ -f "$TASK_FILE" ]; then
+    echo
+    echo "─── PM assigned next task ───"
+    cat "$TASK_FILE"
+    rm -f "$TASK_FILE"
+    [ -f "$NAG_FILE" ] && { echo; cat "$NAG_FILE"; rm -f "$NAG_FILE"; }
+    exit 0
+  fi
+
+  # Daemon dead (and not just transient): bail.
+  if [ -f "$PID_FILE" ]; then
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      # Could be that plan finished naturally. Check that.
+      if [ -f "$STATE_FILE" ] && python3 - "$STATE_FILE" <<'PY' 2>/dev/null
+import json, sys
+s = json.load(open(sys.argv[1]))
+sys.exit(0 if s["tasks"] and all(t["status"] in ("done","failed") for t in s["tasks"]) else 1)
+PY
+      then
+        echo "🎉 project plan complete — no more tasks."
+        exit 0
+      fi
+      echo "⚠️ daemon is no longer running. Try \`tm-pm status\` and \`tm-pm log\`."
+      exit 0
+    fi
+  fi
+
+  # Plan all done AND daemon not in iterate mode → exit.
+  # (In iterate mode, daemon is alive and busy re-profiling/re-planning; just keep polling.)
+  if [ -f "$STATE_FILE" ] && python3 - "$STATE_FILE" <<'PY' 2>/dev/null
+import json, sys, os
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if s["tasks"] and all(t["status"] in ("done","failed") for t in s["tasks"]) else 1)
+PY
+  then
+    # Print a heartbeat every ~30s while the daemon may be re-planning.
+    if [ $((ticks % 60)) -eq 0 ]; then
+      echo "  (current plan is done; daemon may be re-profiling / re-planning…)" >&2
+    fi
+  fi
+
+  # Liveness ping every 30s — Claude is suspended in this bash poll, so
+  # PostToolUse won't fire to keep the worker registered. Without this,
+  # an executor between tasks (waiting in tm-done) gets stale-GC'd at
+  # STALE_AFTER_SEC. Same self-keepalive pattern used by tm-plan-cycle
+  # and tm-supervise.
+  if [ $((ticks % 60)) -eq 0 ]; then
+    pts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    pmid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+    pev="$ROOT/events/${pmid}_progress_${SID}.json"
+    python3 - "$SID" "$pts" > "$pev.tmp" <<'PY'
+import json, sys
+sid, ts = sys.argv[1], sys.argv[2]
+print(json.dumps({"ts": ts, "type": "progress", "session_id": sid, "data": {"source": "tm-done-poll"}}))
+PY
+    mv "$pev.tmp" "$pev"
+  fi
+
+  sleep 0.5
+done

@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""tm-status-report — generate a project-manager-style markdown status snapshot.
+
+Reads pm-state.json + escalations/ + supervisor.log + pm.log timestamps
+and produces a `status-reports/<iso>.md` file with the kind of artefact
+a real PM would circulate at end-of-day or end-of-sprint:
+
+  - executive summary (1 paragraph)
+  - progress (done / in-flight / queued)
+  - velocity (tasks/hour, last hour vs prior hours)
+  - active workers (role + current task)
+  - escalations (open + recently resolved)
+  - risks (tasks reclaimed multiple times, signal failures, long in-flight)
+  - recent supervisor decisions (last 5 from supervisor.log)
+
+Usage:
+  tm-status-report           # write status-reports/<iso>.md, print path
+  tm-status-report --stdout  # print report to stdout instead of file
+  tm-status-report list      # list past reports
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = ROOT / "pm-state.json"
+LOG = ROOT / "pm.log"
+SUP_LOG = ROOT / "supervisor.log"
+ESC_DIR = ROOT / "escalations"
+OUT_DIR = ROOT / "status-reports"
+
+ISO_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z\]")
+
+
+def parse_log_ts(line: str) -> datetime.datetime | None:
+    m = ISO_RE.match(line)
+    if not m:
+        return None
+    return datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+
+
+def velocity_buckets(log_path: Path) -> dict[str, int]:
+    """Count `event done` per hour bucket (last 1h, 1-2h ago, 2-3h ago)."""
+    if not log_path.exists():
+        return {"last_1h": 0, "1_2h": 0, "2_3h": 0}
+    now = datetime.datetime.utcnow()
+    counts = {"last_1h": 0, "1_2h": 0, "2_3h": 0}
+    for raw in log_path.read_text(errors="ignore").splitlines():
+        if "event done" not in raw:
+            continue
+        ts = parse_log_ts(raw)
+        if not ts:
+            continue
+        delta = (now - ts).total_seconds() / 3600.0
+        if delta < 1:
+            counts["last_1h"] += 1
+        elif delta < 2:
+            counts["1_2h"] += 1
+        elif delta < 3:
+            counts["2_3h"] += 1
+    return counts
+
+
+def task_avg_duration(state: dict) -> float | None:
+    """Average completion time in seconds for done tasks with started_ts + completed_ts."""
+    durs = []
+    for t in state["tasks"]:
+        if t["status"] != "done":
+            continue
+        s, c = t.get("started_ts"), t.get("completed_ts")
+        if not s or not c:
+            continue
+        try:
+            ds = datetime.datetime.fromisoformat(s.rstrip("Z"))
+            dc = datetime.datetime.fromisoformat(c.rstrip("Z"))
+            durs.append((dc - ds).total_seconds())
+        except Exception:
+            continue
+    return sum(durs) / len(durs) if durs else None
+
+
+def reclaim_counts_per_task(log_path: Path) -> dict[int, int]:
+    """How many times each task has been reclaimed (a reliability signal)."""
+    counts: Counter[int] = Counter()
+    if not log_path.exists():
+        return {}
+    for raw in log_path.read_text(errors="ignore").splitlines():
+        m = re.search(r"reclaimed task #(\d+)", raw)
+        if m:
+            counts[int(m.group(1))] += 1
+    return dict(counts)
+
+
+def open_escalations() -> list[str]:
+    if not ESC_DIR.is_dir():
+        return []
+    return sorted(p.name for p in ESC_DIR.glob("task-*.md"))
+
+
+def supervisor_recent(n: int = 5) -> list[str]:
+    if not SUP_LOG.exists():
+        return []
+    lines = SUP_LOG.read_text(errors="ignore").splitlines()
+    return lines[-n:]
+
+
+def render(state: dict) -> str:
+    now = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    tasks = state.get("tasks", [])
+    workers = state.get("workers", {})
+
+    n_total = len(tasks)
+    n_done = sum(1 for t in tasks if t["status"] == "done")
+    n_inpg = sum(1 for t in tasks if t["status"] == "in-progress")
+    n_fail = sum(1 for t in tasks if t["status"] == "failed")
+    n_todo = n_total - n_done - n_inpg - n_fail
+
+    vel = velocity_buckets(LOG)
+    avg_dur = task_avg_duration(state)
+    reclaims = reclaim_counts_per_task(LOG)
+    escalations = open_escalations()
+
+    plan_md_count = sum(1 for t in tasks if t.get("source") in (None, "plan.md"))
+    planner_count = sum(1 for t in tasks if t.get("source") == "planner-agent")
+
+    lines = []
+    lines.append(f"# Status report — {now}")
+    lines.append("")
+
+    # Executive summary
+    pct = (100 * n_done / n_total) if n_total else 0
+    summary_health = "🟢 healthy" if not escalations and n_fail == 0 else (
+        "🔴 needs attention" if escalations or n_fail else "🟡 watch")
+    lines.append("## Executive summary")
+    lines.append(f"- {summary_health}: **{n_done}/{n_total}** tasks done ({pct:.0f}%), "
+                 f"{n_inpg} in flight, {n_todo} queued, {n_fail} failed")
+    lines.append(f"- velocity: **{vel['last_1h']}** done in last 1h, "
+                 f"{vel['1_2h']} in 1–2h ago, {vel['2_3h']} in 2–3h ago")
+    if avg_dur is not None:
+        lines.append(f"- avg completion time: **{avg_dur:.0f}s** per task")
+    lines.append(f"- task origins: {plan_md_count} from plan.md, {planner_count} added by planner")
+    lines.append("")
+
+    # Workers
+    lines.append("## Active workers")
+    if not workers:
+        lines.append("- (none registered)")
+    else:
+        for sid, w in workers.items():
+            role = w.get("role", "executor")
+            cur = w.get("current_task_id")
+            cur_s = f"task #{cur}" if cur else "—"
+            lines.append(f"- `{sid[:12]}` · {role} · {w['status']} · {cur_s}")
+    lines.append("")
+
+    # Open escalations
+    lines.append("## Open escalations")
+    if not escalations:
+        lines.append("- (none)")
+    else:
+        for e in escalations:
+            lines.append(f"- ⚠️ `escalations/{e}`")
+    lines.append("")
+
+    # Risks
+    lines.append("## Risks")
+    risks = []
+    for tid, n in reclaims.items():
+        if n >= 2:
+            t = next((x for x in tasks if x["id"] == tid), None)
+            title = t["title"][:80] if t else "?"
+            risks.append(f"- task #{tid} reclaimed **{n}×** — likely too large or a flaky verifier — "
+                         f"`{title}`")
+    for t in tasks:
+        sa = t.get("signal_attempts", 0)
+        if sa >= 2 and t["status"] in ("todo", "in-progress"):
+            risks.append(f"- task #{t['id']} signal_cmd failed **{sa}×** — review verifier or implementation")
+    for t in tasks:
+        if t["status"] != "in-progress":
+            continue
+        s = t.get("started_ts")
+        if not s:
+            continue
+        try:
+            ds = datetime.datetime.fromisoformat(s.rstrip("Z"))
+            elapsed = (datetime.datetime.utcnow() - ds).total_seconds()
+            if elapsed > 600:
+                risks.append(f"- task #{t['id']} in-progress for {elapsed:.0f}s — possibly stuck")
+        except Exception:
+            pass
+    if not risks:
+        lines.append("- (none)")
+    else:
+        for r in risks:
+            lines.append(r)
+    lines.append("")
+
+    # Recent supervisor decisions
+    lines.append("## Recent supervisor decisions (last 5)")
+    rec = supervisor_recent(5)
+    if not rec:
+        lines.append("- (none)")
+    else:
+        for ln in rec:
+            lines.append(f"- {ln}")
+    lines.append("")
+
+    # Final tasks list
+    lines.append("## Tasks")
+    for t in tasks:
+        mark = {"done": "✓", "in-progress": "▶", "failed": "✗", "todo": "·"}.get(t["status"], "?")
+        title = t["title"][:100]
+        lines.append(f"- {mark} #{t['id']} [{t['status']}] {title}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+
+    if args and args[0] == "list":
+        if not OUT_DIR.is_dir():
+            print("(no reports yet)")
+            return 0
+        for p in sorted(OUT_DIR.iterdir(), reverse=True):
+            print(f"  {p.name}")
+        return 0
+
+    if not STATE.exists():
+        print("tm-status-report: no pm-state.json (daemon hasn't run yet?)", file=sys.stderr)
+        return 1
+    try:
+        state = json.loads(STATE.read_text())
+    except Exception as e:
+        print(f"tm-status-report: pm-state.json unreadable: {e}", file=sys.stderr)
+        return 1
+
+    body = render(state)
+
+    if args and args[0] == "--stdout":
+        print(body)
+        return 0
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+    out = OUT_DIR / f"{ts}.md"
+    out.write_text(body)
+    print(f"✓ status report written: status-reports/{ts}.md")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Assessor worker. Looks at workspace/ + history of done tasks, decides ONE
+# concrete improvement worth making right now (or declares the project clean).
+# Writes its verdict as an event for the PM daemon to ingest.
+#
+# Event types produced:
+#   add_task        — proposes one new task, with title and signal_cmd
+#   assess_clean    — nothing more worth doing right now
+#
+# Usage: tm-assess
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE="$ROOT/workspace"
+STATE_FILE="$ROOT/pm-state.json"
+
+if [ ! -d "$WORKSPACE" ]; then
+  echo "tm-assess: $WORKSPACE not found" >&2
+  exit 1
+fi
+
+if ! command -v claude >/dev/null; then
+  echo "tm-assess: claude CLI not found" >&2
+  exit 2
+fi
+
+# Build a compact summary of what's already been considered (titles + signal results).
+HISTORY=$(python3 - "$STATE_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    print("(no prior tasks)")
+    sys.exit(0)
+lines = []
+for t in s.get("tasks", []):
+    sig = "PASS" if "[signal: PASS]" in (t.get("summary") or "") else \
+          "FAIL" if t.get("signal_history") else "-"
+    lines.append(f"  - #{t['id']} [{t['status']}/{sig}] {t['title'][:120]}")
+for entry in s.get("history", []):
+    for t in entry.get("tasks", []):
+        sig = "PASS" if "[signal: PASS]" in (t.get("summary") or "") else "-"
+        lines.append(f"  - (prev) [{t['status']}/{sig}] {t['title'][:120]}")
+print("\n".join(lines) or "(no prior tasks)")
+PY
+)
+
+GOAL_TXT=""
+[ -f "$ROOT/goal.md" ] && GOAL_TXT=$(cat "$ROOT/goal.md")
+
+prompt="You are an Assessor agent. Your job: look at the project under \`$WORKSPACE\` and decide whether ONE concrete improvement is worth making RIGHT NOW. If the project meets all stated goals, declare it clean.
+
+PROJECT GOAL:
+---
+$GOAL_TXT
+---
+
+ALREADY-DONE / IN-PROGRESS / FAILED TASKS (don't propose duplicates):
+---
+$HISTORY
+---
+
+Your steps:
+1. Use Read/Bash/Grep/Glob to inspect the workspace efficiently. Run any verifying commands (tests, greps) you need. DON'T edit files.
+2. Decide one of:
+   (a) Propose ONE new task that addresses a real, unaddressed gap. Must include a signal_cmd whose exit 0 = the gap is closed.
+   (b) Declare the project clean — no more meaningful improvements right now.
+
+3. Use the Write tool to write EXACTLY ONE event file at one of these paths:
+
+   For a new task:
+     $ROOT/events/\$(date +%s%N)_add-task_assessor.json
+   with content:
+     {\"ts\": \"<ISO-8601 UTC>\", \"type\": \"add_task\", \"session_id\": \"assessor\", \"data\": {\"title\": \"<imperative one-line task title>\", \"signal_cmd\": \"<shell command, exit 0 = task done>\"}}
+
+   For clean:
+     $ROOT/events/\$(date +%s%N)_assess-clean_assessor.json
+   with content:
+     {\"ts\": \"<ISO-8601 UTC>\", \"type\": \"assess_clean\", \"session_id\": \"assessor\", \"data\": {\"reason\": \"<one short sentence why nothing more to do>\"}}
+
+   (You can compute \$(date +%s%N) by running \`date +%s%N\` once and using that timestamp.)
+
+4. After Write succeeds, reply with one line: 'event written'. No further prose.
+
+RULES:
+- Pick the SINGLE highest-leverage gap. Don't try to bundle multiple improvements into one task.
+- Don't propose anything already on the done/in-progress/failed list above.
+- signal_cmd MUST be a real, runnable shell command from $WORKSPACE. Prefer simple commands: grep -q, pytest -k, test -f. Avoid embedded double quotes.
+- Be honest about 'clean' — if the goal is genuinely met, say so. Don't fabricate work.
+- DO NOT edit any files in workspace/. Read-only assessment.
+
+Begin."
+
+echo "▸ assessor running …" >&2
+log=$(mktemp -t tm-assess.XXXXXX)
+TM_AUTO=1 claude -p \
+  --allowedTools "Read,Bash,Grep,Glob,Write" \
+  --append-system-prompt "Be concise. Use tools. End by writing exactly one event file and replying 'event written'." \
+  "$prompt" >"$log" 2>&1 || true
+
+# Verify an event file was actually written.
+new_events=$(find "$ROOT/events" -maxdepth 1 -name '*assessor*.json' -newer "$log" 2>/dev/null | head -1)
+if [ -z "$new_events" ]; then
+  # Fallback: any event file with 'assessor' in name created recently
+  new_events=$(ls -t "$ROOT/events"/*assessor*.json 2>/dev/null | head -1)
+fi
+
+if [ -z "$new_events" ]; then
+  echo "tm-assess: assessor produced no event file. log tail:" >&2
+  tail -n 30 "$log" >&2
+  rm -f "$log"
+  exit 4
+fi
+
+echo "✓ assessor emitted: $(basename "$new_events")" >&2
+python3 -c "
+import json
+d = json.load(open('$new_events'))
+print('  type:', d.get('type'))
+print('  data:', json.dumps(d.get('data', {}), ensure_ascii=False)[:300])
+" >&2 || true
+rm -f "$log"

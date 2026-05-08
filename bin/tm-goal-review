@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Judge whether the project has met its top-level goal.md.
+# Spawns `claude -p` to inspect workspace/ and grade against every axis
+# in goal.md. Output (one JSON line on stdout):
+#   {"verdict":"DONE"|"CONTINUE","reason":"..."}
+#
+# Used as an outer-loop exit gate by pm-daemon.py when PM_GOAL_REVIEW=1.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GOAL="$ROOT/goal.md"
+WORKSPACE="$ROOT/workspace"
+
+if [ ! -f "$GOAL" ]; then
+  python3 -c 'import json; print(json.dumps({"verdict":"DONE","reason":"no goal.md — nothing to verify against"}))'
+  exit 0
+fi
+
+if ! command -v claude >/dev/null; then
+  python3 -c 'import json; print(json.dumps({"verdict":"DONE","reason":"claude CLI not available; auto-pass"}))'
+  exit 0
+fi
+
+goal_text=$(cat "$GOAL")
+
+prompt="You are auditing whether a software project has met its stated goal.
+
+GOAL (verbatim from goal.md):
+---
+$goal_text
+---
+
+WORKSPACE TO INSPECT: $WORKSPACE/
+
+YOUR JOB:
+1. Read / grep / run whatever you need under $WORKSPACE/ to verify EACH axis of the goal.
+2. If the goal states a test should exist or pass, RUN IT and check exit code.
+3. Be strict but bounded — only judge against axes the goal actually states.
+4. CONTINUE means at least one axis is unmet. DONE means every axis is satisfied.
+
+Reply with EXACTLY one JSON object on a single line, nothing else:
+{\"verdict\": \"DONE\" or \"CONTINUE\", \"reason\": \"<one sentence: why DONE, or what's still missing>\"}
+
+Output now:"
+
+# Capture both streams; the regex parser below pulls JSON out regardless of mixed prose.
+raw=$(claude -p --allowedTools "Read,Bash,Grep,Glob" "$prompt" 2>&1 || true)
+
+python3 - <<PY
+import json, re, sys
+raw = """$raw"""
+m = re.search(r'\{[^{}]*"verdict"[^{}]*"reason"[^{}]*\}', raw, re.DOTALL)
+if m:
+    try:
+        d = json.loads(m.group(0))
+        v = (d.get("verdict") or "").upper()
+        if v not in ("DONE", "CONTINUE"):
+            v = "CONTINUE"
+        print(json.dumps({"verdict": v, "reason": d.get("reason", "(no reason)")}))
+        sys.exit(0)
+    except json.JSONDecodeError:
+        pass
+upper = raw.upper()
+if "DONE" in upper and "CONTINUE" not in upper:
+    print(json.dumps({"verdict":"DONE","reason":"goal-reviewer said DONE (parsed loosely)"}))
+elif "CONTINUE" in upper:
+    print(json.dumps({"verdict":"CONTINUE","reason":"goal-reviewer said CONTINUE (parsed loosely)"}))
+else:
+    print(json.dumps({"verdict":"CONTINUE","reason":"goal-reviewer output unparseable: " + raw[:200]}))
+PY

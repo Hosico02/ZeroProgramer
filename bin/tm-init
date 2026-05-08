@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# tm-init — bootstrap a new project directory with the multi-agent
+# project-management framework: PM daemon + supervisor/planner/executor
+# Claude roles + auto status reports + decision log + goal versioning.
+#
+# Usage:
+#   tm-init <target-dir>            create fresh project at <target-dir>
+#   tm-init <target-dir> --here     existing-dir mode: install AROUND files
+#                                    that are already there (uses target as
+#                                    workspace/ source). Confirms before
+#                                    moving any files.
+#
+# After init the user should:
+#   1. cd <target-dir>
+#   2. edit goal.md           — describe what 'done' looks like
+#   3. (optional) cp -r your-code/* workspace/  — for fresh-mode
+#   4. ./bin/tm-team-up 2     — bring up supervisor + planner + 2 executors
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  cat >&2 <<EOF
+usage: tm-init <target-dir>            # create new project at target
+       tm-init <target-dir> --here     # wrap existing dir as project
+EOF
+  exit 1
+fi
+
+TARGET="$1"
+HERE_MODE=0
+[ "${2:-}" = "--here" ] && HERE_MODE=1
+
+# Resolve self (the source framework dir)
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [ "$HERE_MODE" = "0" ]; then
+  if [ -e "$TARGET" ]; then
+    echo "tm-init: $TARGET already exists. Use --here to install around it." >&2
+    exit 2
+  fi
+  mkdir -p "$TARGET"
+fi
+
+TARGET_ABS="$(cd "$TARGET" && pwd)"
+
+if [ "$TARGET_ABS" = "$SELF" ]; then
+  echo "tm-init: refusing to install onto myself ($SELF)" >&2
+  exit 2
+fi
+
+cd "$TARGET_ABS"
+
+# ── 1. bin/ — tools (always overwrite if --here, since these are framework code) ──
+echo "▸ installing bin/ from $SELF/bin/"
+mkdir -p bin
+# Skip tm-init itself (recursive copy of itself is weird), and skip any project-local
+# convenience that wouldn't apply (like setup-self-optimize, which is bespoke).
+for f in "$SELF/bin/"*; do
+  name="$(basename "$f")"
+  [ "$name" = "tm-init" ] && continue
+  cp -p "$f" "bin/$name"
+done
+chmod +x bin/*
+
+# ── 2. .claude/settings.json ──
+echo "▸ installing .claude/settings.json"
+mkdir -p .claude
+cp -p "$SELF/.claude/settings.json" .claude/
+
+# ── 3. CLAUDE.md — worker instructions ──
+if [ ! -f CLAUDE.md ]; then
+  echo "▸ writing CLAUDE.md (executor instructions)"
+  cp -p "$SELF/CLAUDE.md" CLAUDE.md
+fi
+
+# ── 4. goal.md template ──
+if [ ! -f goal.md ]; then
+  echo "▸ writing goal.md template"
+  cat > goal.md <<'EOF'
+# Project goal: <CHANGE ME — describe what success looks like for this project>
+
+Be concrete. List the specific axes that define "done". Each axis becomes
+a check the planner agent looks for when deciding what task to propose
+next or whether to declare the project clean.
+
+Examples of good axes (replace with yours):
+
+- **Tests pass**: `pytest -q` exits 0 on every commit.
+- **No shell injection**: any user input flowing through bash is quoted
+  or passed via argv; tests/test_shell_injection.py covers known vectors.
+- **Documented**: README has a 'Tuning' section listing all env-var
+  overrides; each documented var has a real default.
+- **<your axis>**: <how to verify it>
+
+## Constraints
+
+- (e.g. don't add external Python deps)
+- (e.g. don't break the public CLI surface)
+- (e.g. all tests in tests/ must run cleanly with `python3 -m pytest -q`)
+EOF
+fi
+
+# ── 5. plan.md (optional starter) ──
+if [ ! -f plan.md ]; then
+  echo "▸ writing plan.md starter (delete or replace as needed)"
+  cat > plan.md <<'EOF'
+# Project: starter plan (replace with your own)
+
+The planner agent will keep this updated; you only need to seed it
+once with a few obvious tasks if you want a head start. Otherwise
+delete this file and let the planner generate plan.md from goal.md.
+
+1. Verify the project's existing tests pass.
+   signal_cmd: python3 -m pytest -q tests/ 2>/dev/null || true
+
+EOF
+fi
+
+# ── 6. workspace/ ──
+if [ ! -d workspace ]; then
+  echo "▸ creating workspace/ (this is where the executor agent edits code)"
+  mkdir -p workspace
+  cat > workspace/.placeholder <<'EOF'
+Place your project files here. The executor agent edits workspace/* and
+ONLY workspace/* — bin/, goal.md, .claude/, etc. are framework files
+the agents never touch directly (supervisor can edit goal.md via
+tm-supervise revise-goal).
+
+Quick start:
+  cp -r ~/your-project/* .                  # populate
+  rm .placeholder
+EOF
+fi
+
+# ── 7. PM runtime dirs (will be auto-created on first run, but fine to make now) ──
+mkdir -p events tasks nags
+
+# ── 8. .gitignore (helpful default) ──
+if [ ! -f .gitignore ]; then
+  cat > .gitignore <<'EOF'
+# tm runtime state — should not be checked in
+events/
+tasks/
+nags/
+escalations/
+goal-history/
+status-reports/
+decisions/
+pm-state.json
+pm.log
+pm.pid
+planner.log
+planner.pid
+supervisor.log
+.session-id
+bin/.promoted-bak/
+EOF
+  echo "▸ wrote .gitignore"
+fi
+
+# ── 9. Summary ──
+cat <<EOF
+
+✓ tm-team project initialized at $TARGET_ABS
+
+Next steps:
+  cd $TARGET_ABS
+  \$EDITOR goal.md                      # describe what 'done' means
+  cp -r <your-code>/* workspace/        # populate workspace (or rm workspace/.placeholder)
+  ./bin/tm-team-up 2                    # bring up supervisor + planner + 2 executors
+
+Single-window alternatives:
+  ./bin/tm-pm start --forever           # background daemon only
+  ./bin/tm-claude-supervisor            # then open agent windows manually
+  ./bin/tm-claude-planner
+  ./bin/tm-claude-executor
+
+Monitor real-time:
+  ./bin/tm-pm watch
+EOF

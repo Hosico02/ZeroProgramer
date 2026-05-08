@@ -1,0 +1,52 @@
+# ── tm-team runtime state (top level) ──
+events/
+tasks/
+nags/
+escalations/
+goal-history/
+status-reports/
+decisions/
+pm-state.json
+pm.log
+pm.pid
+planner.log
+planner.pid
+supervisor.log
+.session-id
+.auto-loop.pid
+auto-loop.log
+auto-loop.console
+bin/.promoted-bak/
+
+# ── third-party agent state ──
+.teamagent/
+
+# ── workspace/ runtime state (workspace is the agent's edit area; the
+#    project files inside it are committed, but PM runtime is not) ──
+workspace/events/
+workspace/tasks/
+workspace/nags/
+workspace/escalations/
+workspace/pm-state.json
+workspace/pm.log
+workspace/pm.pid
+workspace/planner.log
+workspace/planner.pid
+workspace/supervisor.log
+workspace/.session-id
+workspace/.auto-loop.pid
+workspace/auto-loop.log
+workspace/auto-loop.console
+workspace/manifest.json
+
+# ── transient backup files made by setup-self-optimize ──
+workspace.bak.*
+workspace.bak.*/
+
+# ── editor / OS junk ──
+.DS_Store
+*.pyc
+__pycache__/
+*.swp
+.idea/
+.vscode/

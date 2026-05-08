@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# tm-decision — ADR-style architectural decision record for the supervisor.
+#
+# Each non-trivial choice supervisor makes (skip-promoting a workspace file,
+# choosing not to revise goal despite signals, accepting an escalation as
+# wontfix, etc.) gets a numbered .md file. Future supervisors (or humans)
+# can read these to understand WHY the system is in its current shape.
+#
+# Usage:
+#   tm-decision new "<title>" "<context>" "<decision>" "<consequences>"
+#   tm-decision list
+#   tm-decision show <number>     # e.g. tm-decision show 3
+#
+# Files land in decisions/<NNN>-<slug>.md (NNN auto-incremented).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEC_DIR="$ROOT/decisions"
+SUP_LOG="$ROOT/supervisor.log"
+SID="${CLAUDE_CODE_SESSION_ID:-cli}"
+
+slugify() {
+  python3 -c "
+import sys, re
+s = sys.argv[1].lower()
+s = re.sub(r'[^a-z0-9]+', '-', s)
+s = re.sub(r'^-+|-+\$', '', s)
+print(s[:60] or 'untitled')
+" "$1"
+}
+
+case "${1:-}" in
+  new)
+    title="${2:-}"; context="${3:-}"; decision="${4:-}"; consequences="${5:-}"
+    if [ -z "$title" ] || [ -z "$decision" ]; then
+      cat >&2 <<EOF
+Usage: tm-decision new "<title>" "<context>" "<decision>" "<consequences>"
+  - title:        one-line summary (becomes filename slug)
+  - context:      what's the situation? what data led to this?
+  - decision:     what did you decide? (be concrete)
+  - consequences: what does this enable/preclude/imply?
+EOF
+      exit 1
+    fi
+
+    mkdir -p "$DEC_DIR"
+    # next sequence number
+    last=$(ls -1 "$DEC_DIR" 2>/dev/null | grep -E '^[0-9]{3}-' | sed 's/-.*//' | sort -n | tail -1 || echo "")
+    next=$(( ${last:-0} + 1 ))
+    num=$(printf '%03d' "$next")
+    slug=$(slugify "$title")
+    out="$DEC_DIR/${num}-${slug}.md"
+
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$out" <<EOF
+# ${num}. ${title}
+
+- **status:** decided
+- **decided_at:** ${ts}
+- **decided_by:** supervisor session \`${SID:0:12}\`
+
+## Context
+${context:-(no context provided)}
+
+## Decision
+${decision}
+
+## Consequences
+${consequences:-(none stated)}
+EOF
+    # Mirror to supervisor.log so the cycle's note appears in chronological flow
+    printf '[%s] supervisor=%s DECISION-%s: %s\n' "$ts" "${SID:0:8}" "$num" "$title" >> "$SUP_LOG"
+
+    echo "✓ wrote $out"
+    ;;
+
+  list)
+    if [ ! -d "$DEC_DIR" ] || [ -z "$(ls -A "$DEC_DIR" 2>/dev/null)" ]; then
+      echo "(no decisions yet)"
+      exit 0
+    fi
+    for f in $(ls -1 "$DEC_DIR" | sort); do
+      title=$(sed -n '1s/^# [0-9]*\. //p' "$DEC_DIR/$f")
+      ts=$(sed -n 's/^- \*\*decided_at:\*\* //p' "$DEC_DIR/$f")
+      printf '  %s  %-22s  %s\n' "${f%.md}" "$ts" "$title"
+    done
+    ;;
+
+  show)
+    n="${2:-}"
+    [ -z "$n" ] && { echo "tm-decision show <number>" >&2; exit 1; }
+    num=$(printf '%03d' "$n" 2>/dev/null || echo "$n")
+    f=$(ls -1 "$DEC_DIR"/$num-*.md 2>/dev/null | head -1)
+    [ -z "$f" ] && { echo "tm-decision: decision $num not found" >&2; exit 1; }
+    cat "$f"
+    ;;
+
+  -h|--help|"")
+    sed -n '2,15p' "$0" | sed 's/^# \?//'
+    ;;
+
+  *)
+    echo "tm-decision: unknown subcommand '$1'" >&2
+    echo "Usage: tm-decision {new|list|show <N>}" >&2
+    exit 1
+    ;;
+esac

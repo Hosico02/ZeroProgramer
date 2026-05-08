@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# tm-planner — continuous-planning daemon. Runs alongside pm-daemon.
+#
+# Role: every PLANNER_INTERVAL seconds, invoke tm-assess. Assessor inspects
+# workspace + done/in-progress tasks + goal.md, decides whether to (a) emit
+# an add_task event to feed PM, or (b) emit assess_clean. PM picks up those
+# events as part of its normal event loop, so no IPC or shared state with
+# tm-planner is needed beyond the events/ inbox.
+#
+# Why separate from pm-daemon: keeps the PM state machine deterministic and
+# fast (no LLM calls in the hot path), and lets the planner be started /
+# stopped / restarted independently from the worker dispatcher.
+#
+# Usage: tm-planner {start|stop|status|log [N]|tail|restart}
+# Env:   PLANNER_INTERVAL  default 60s. How often to invoke tm-assess.
+#        PLANNER_MIN_TODO  default 1.  Skip assessment if N+ todo tasks
+#                                       already queued (don't pile on).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PIDFILE="$ROOT/planner.pid"
+LOG="$ROOT/planner.log"
+ASSESS="$ROOT/bin/tm-assess"
+STATE="$ROOT/pm-state.json"
+
+INTERVAL="${PLANNER_INTERVAL:-60}"
+MIN_TODO="${PLANNER_MIN_TODO:-1}"
+
+is_running() {
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+case "${1:-}" in
+  start)
+    if is_running; then
+      echo "tm-planner already running (pid $(cat "$PIDFILE"))"
+      exit 0
+    fi
+    : > "$LOG"
+    nohup env PLANNER_INTERVAL="$INTERVAL" PLANNER_MIN_TODO="$MIN_TODO" \
+      bash "$0" __loop >>"$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 0.4
+    if is_running; then
+      echo "✓ tm-planner started (pid $(cat "$PIDFILE")), interval ${INTERVAL}s, min_todo=${MIN_TODO}"
+      echo "  log: $LOG"
+    else
+      echo "✗ tm-planner failed to start. log:"
+      tail -n 20 "$LOG" 2>/dev/null || true
+      exit 1
+    fi
+    ;;
+
+  stop)
+    if is_running; then
+      kill "$(cat "$PIDFILE")" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$(cat "$PIDFILE")" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+    echo "✓ tm-planner stopped"
+    ;;
+
+  restart)
+    "$0" stop >/dev/null 2>&1 || true
+    "$0" start
+    ;;
+
+  status)
+    if is_running; then
+      echo "✓ tm-planner running (pid $(cat "$PIDFILE"))"
+    else
+      echo "✗ tm-planner not running"
+      exit 1
+    fi
+    if [ -f "$STATE" ]; then
+      python3 - "$STATE" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+todo = sum(1 for t in s["tasks"] if t["status"] == "todo")
+inpg = sum(1 for t in s["tasks"] if t["status"] == "in-progress")
+done = sum(1 for t in s["tasks"] if t["status"] == "done")
+fail = sum(1 for t in s["tasks"] if t["status"] == "failed")
+streak = s.get("assess_clean_streak", 0)
+print(f"  pm queue: {todo} todo / {inpg} in-progress / {done} done / {fail} failed")
+print(f"  assessor clean-streak: {streak}")
+PY
+    fi
+    ;;
+
+  log)
+    n="${2:-50}"
+    tail -n "$n" "$LOG" 2>/dev/null || echo "(no log)"
+    ;;
+
+  tail)
+    exec tail -F "$LOG"
+    ;;
+
+  __loop)
+    # Internal mode — runs the actual scheduling loop.
+    trap 'exit 0' INT TERM
+    while true; do
+      ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+      # Skip if PM queue already has enough todo work — don't pile on.
+      todo_count=0
+      if [ -f "$STATE" ]; then
+        todo_count=$(python3 - "$STATE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    print(0); sys.exit(0)
+print(sum(1 for t in s["tasks"] if t["status"] == "todo"))
+PY
+)
+      fi
+
+      if [ "$todo_count" -ge "$MIN_TODO" ]; then
+        echo "[$ts] queue has $todo_count todo (>= $MIN_TODO), skipping assessment"
+      else
+        echo "[$ts] queue has $todo_count todo (< $MIN_TODO), invoking tm-assess"
+        if "$ASSESS"; then
+          echo "[$ts]   ✓ assessor returned 0"
+        else
+          echo "[$ts]   ✗ assessor exit $?"
+        fi
+      fi
+
+      sleep "$INTERVAL"
+    done
+    ;;
+
+  ""|-h|--help)
+    sed -n '1,18p' "$0" | sed 's/^# \?//'
+    ;;
+
+  *)
+    echo "tm-planner: unknown subcommand '$1'" >&2
+    echo "usage: tm-planner {start|stop|status|log [N]|tail|restart}" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Supervisor CLI: emit one supervisor verdict, then block until the next
+# review cycle is warranted. Mirrors tm-plan-cycle but for the supervisor
+# role (the "brain").
+#
+# Subcommands:
+#   tm-supervise note     "<one-line observation>"
+#       Log to supervisor.log; block for SUPERVISE_INTERVAL seconds OR until
+#       a new escalation appears, then print fresh context and return.
+#
+#   tm-supervise shutdown "<one-line reason>"
+#       Emit a shutdown event for pm-daemon; do NOT block (the system is
+#       ending). Also writes a final note.
+#
+# Env:
+#   SUPERVISE_INTERVAL   default 600 (10 min). Wake-up cadence between
+#                        cycles when no escalation arrives.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SID="${CLAUDE_CODE_SESSION_ID:-}"
+[ -z "$SID" ] && SID=$(cat "$ROOT/.session-id" 2>/dev/null || echo "unknown")
+
+STATE_FILE="$ROOT/pm-state.json"
+PID_FILE="$ROOT/pm.pid"
+ESC_DIR="$ROOT/escalations"
+SUP_LOG="$ROOT/supervisor.log"
+INTERVAL="${SUPERVISE_INTERVAL:-600}"
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+mid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+
+note_log() {
+  printf '[%s] supervisor=%s %s\n' "$ts" "${SID:0:8}" "$1" >> "$SUP_LOG"
+}
+
+case "${1:-}" in
+  revise-goal)
+    # L6 entry point: snapshot current goal.md, then surface instructions
+    # for the supervisor agent to use the Edit tool on goal.md. Doesn't
+    # itself edit — the agent's Edit tool does — but it makes the move
+    # auditable (snapshot + log).
+    rationale="${2:-}"
+    [ -z "$rationale" ] && { echo "tm-supervise revise-goal: missing rationale" >&2; exit 1; }
+    if [ ! -f "$ROOT/goal.md" ]; then
+      echo "tm-supervise revise-goal: $ROOT/goal.md not found" >&2; exit 1
+    fi
+    snap_path=$("$ROOT/bin/tm-goal-snapshot" snapshot | tail -n 1)
+    note_log "REVISE-GOAL: $rationale (snapshot: $(basename "$snap_path"))"
+    cat <<EOF
+✓ goal.md snapshotted: $(basename "$snap_path")
+✓ rationale logged to supervisor.log
+
+Now use the Edit tool to modify goal.md. Keep changes:
+  - additive when broadening scope (don't delete existing axes)
+  - explicit when refining (replace ambiguous wording with concrete checks)
+  - small (one edit per cycle, easier to roll back if it backfires)
+
+After editing, end this cycle as usual:
+  tm-supervise note "<one-line summary of what you changed in goal.md>"
+
+To inspect history later:
+  tm-goal-snapshot list
+  tm-goal-snapshot diff 1     # diff vs latest snapshot
+EOF
+    exit 0
+    ;;
+
+  note)
+    msg="${2:-}"
+    [ -z "$msg" ] && { echo "tm-supervise note: missing observation" >&2; exit 1; }
+    note_log "note: $msg"
+    echo "✓ note logged: $msg" >&2
+    ;;
+
+  shutdown)
+    reason="${2:-}"
+    [ -z "$reason" ] && { echo "tm-supervise shutdown: missing reason" >&2; exit 1; }
+    ev="$ROOT/events/${mid}_shutdown_${SID}.json"
+    python3 - "$SID" "$ts" "$reason" > "$ev.tmp" <<'PY'
+import json, sys
+sid, ts, reason = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({"ts": ts, "type": "shutdown", "session_id": sid, "data": {"reason": reason}}))
+PY
+    mv "$ev.tmp" "$ev"
+    note_log "SHUTDOWN: $reason"
+    echo "✓ shutdown event written. PM will exit on next tick." >&2
+    exit 0
+    ;;
+
+  *)
+    cat >&2 <<EOF
+Usage: tm-supervise note        "<one-line observation>"
+       tm-supervise shutdown    "<one-line reason>"
+       tm-supervise revise-goal "<rationale>"
+EOF
+    exit 1
+    ;;
+esac
+
+# ── Headless mode: don't block ──
+if [ "${TM_AUTO:-0}" = "1" ]; then
+  exit 0
+fi
+
+# ── Block until next cycle ──
+escalation_count() {
+  if [ -d "$ESC_DIR" ]; then
+    find "$ESC_DIR" -maxdepth 1 -name 'task-*.md' 2>/dev/null | wc -l | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+start_esc=$(escalation_count)
+echo "▸ note logged. blocking ${INTERVAL}s for next supervisor cycle (or earlier if new escalation arrives)…" >&2
+
+elapsed=0
+while [ "$elapsed" -lt "$INTERVAL" ]; do
+  # Daemon dead → exit cleanly
+  if [ -f "$PID_FILE" ] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo
+    echo "⚠️ pm-daemon is no longer running. Supervisor loop ends."
+    exit 0
+  fi
+
+  cur_esc=$(escalation_count)
+  if [ "$cur_esc" -gt "$start_esc" ]; then
+    echo
+    echo "─── New escalation appeared ($start_esc → $cur_esc); waking supervisor ───"
+    break
+  fi
+
+  # Self-keepalive every 30s so PM doesn't stale-GC the supervisor while it's
+  # blocked here (no PostToolUse fires during this poll).
+  if [ $((elapsed % 30)) -eq 0 ] && [ "$elapsed" -gt 0 ]; then
+    pts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    pmid=$(python3 -c 'import time; print(int(time.time()*1_000_000))')
+    pev="$ROOT/events/${pmid}_progress_${SID}.json"
+    python3 - "$SID" "$pts" > "$pev.tmp" <<'PY'
+import json, sys
+sid, ts = sys.argv[1], sys.argv[2]
+print(json.dumps({"ts": ts, "type": "progress", "session_id": sid, "data": {"source": "supervisor-poll"}}))
+PY
+    mv "$pev.tmp" "$pev"
+  fi
+
+  sleep 5
+  elapsed=$((elapsed + 5))
+done
+
+if [ "$elapsed" -ge "$INTERVAL" ]; then
+  echo
+  echo "─── ${INTERVAL}s elapsed; waking supervisor for routine cycle ───"
+fi
+
+# Print fresh context for supervisor's next assessment turn.
+if [ -f "$STATE_FILE" ]; then
+  python3 - "$STATE_FILE" "$ESC_DIR" <<'PY'
+import json, os, sys
+state_p, esc_dir = sys.argv[1], sys.argv[2]
+s = json.load(open(state_p))
+done = sum(1 for t in s["tasks"] if t["status"] == "done")
+fail = sum(1 for t in s["tasks"] if t["status"] == "failed")
+inpg = sum(1 for t in s["tasks"] if t["status"] == "in-progress")
+todo = sum(1 for t in s["tasks"] if t["status"] == "todo")
+print(f"  state: {todo} todo / {inpg} in-progress / {done} done / {fail} failed (clean-streak {s.get('assess_clean_streak',0)})")
+print(f"  workers ({len(s['workers'])}):")
+for sid, w in s["workers"].items():
+    role = w.get("role", "executor")
+    cur = w.get("current_task_id")
+    print(f"    {sid[:12]:14s} role={role:10s} {w['status']:8s} task={cur}")
+if os.path.isdir(esc_dir):
+    files = sorted([f for f in os.listdir(esc_dir) if f.startswith("task-") and f.endswith(".md")])
+    if files:
+        print(f"  escalations ({len(files)}):")
+        for f in files:
+            print(f"    - {f}")
+    else:
+        print("  escalations: none")
+PY
+fi
+
+cat <<EOF
+
+Inspect with: tm-pm status, ls escalations/, tail pm.log, tm-context list
+Then act (edit goal.md / resolve escalations / etc.), then end with:
+  tm-supervise note "<one-line observation>"
+or, if you've decided the project is genuinely done:
+  tm-supervise shutdown "<one-line reason>"
+EOF

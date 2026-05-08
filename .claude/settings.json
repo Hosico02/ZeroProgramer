@@ -1,0 +1,74 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "$CLAUDE_PROJECT_DIR/bin/tm-statusline",
+    "padding": 0
+  },
+  "permissions": {
+    "allow": [
+      "Bash(./bin/tm-pm:*)",
+      "Bash(./bin/tm-done:*)",
+      "Bash(./bin/tm-plan-cycle:*)",
+      "Bash(./bin/tm-supervise:*)",
+      "Bash(./bin/tm-context:*)",
+      "Bash(./bin/tm-assess:*)",
+      "Bash(./bin/tm-goal-review:*)",
+      "Bash(./bin/tm-profile:*)",
+      "Bash(./bin/tm-plan:*)",
+      "Bash(./bin/tm-review:*)",
+      "Bash(./bin/tm-launch-helpers:*)",
+      "Bash(./bin/tm-team-up:*)",
+      "Bash(./bin/tm-promote:*)",
+      "Bash(./bin/tm-goal-snapshot:*)",
+      "Bash(./bin/tm-status-report:*)",
+      "Bash(./bin/tm-decision:*)",
+      "Bash(./bin/tm-risk-list:*)",
+      "Bash(tm-pm:*)",
+      "Bash(tm-done:*)",
+      "Bash(tm-plan-cycle:*)",
+      "Bash(tm-supervise:*)",
+      "Bash(tm-context:*)",
+      "Bash(tm-launch-helpers:*)",
+      "Bash(tm-promote:*)",
+      "Bash(tm-goal-snapshot:*)",
+      "Bash(tm-status-report:*)",
+      "Bash(tm-decision:*)",
+      "Bash(tm-risk-list:*)",
+      "Bash(osascript:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/tm-session-hook" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/tm-prompt-hook" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/tm-stop-hook" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/tm-tool-hook" }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Emit a compact one-line status string suitable for a terminal window
+title. Plain text, no ANSI colors. Designed to be read by tm-title-keeper
+and shoved into the parent terminal's title bar every couple seconds."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = ROOT / "pm-state.json"
+PID = ROOT / "pm.pid"
+
+
+def daemon_running() -> bool:
+    if not PID.exists():
+        return False
+    try:
+        pid = int(PID.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def main() -> int:
+    proj = ROOT.name
+    dot = "●" if daemon_running() else "○"
+    if not STATE.exists():
+        print(f"{dot} {proj} · idle")
+        return 0
+    try:
+        s = json.loads(STATE.read_text())
+    except Exception:
+        print(f"{dot} {proj} · ?")
+        return 0
+
+    tasks = s.get("tasks", [])
+    workers = s.get("workers", {})
+    n_done = sum(1 for t in tasks if t["status"] == "done")
+    n_inpg = sum(1 for t in tasks if t["status"] == "in-progress")
+    n_fail = sum(1 for t in tasks if t["status"] == "failed")
+    n_total = len(tasks)
+    n_busy = sum(1 for w in workers.values() if w.get("status") == "busy")
+    n_workers = len(workers)
+
+    parts = [f"{dot} {proj}"]
+    if n_total:
+        parts.append(f"{n_done}/{n_total}")
+        if n_inpg:
+            parts.append(f"▶{n_inpg}")
+        if n_fail:
+            parts.append(f"✗{n_fail}")
+    if n_workers:
+        parts.append(f"{n_busy}/{n_workers}w")
+
+    role = os.environ.get("TM_ROLE")
+    if role:
+        parts.append(role[:3])  # sup/pla/exe
+
+    print(" · ".join(parts))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

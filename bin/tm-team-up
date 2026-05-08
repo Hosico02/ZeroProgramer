@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# One-shot bootstrap for the full multi-agent team.
+#
+# Does:
+#   1. tm-pm reset                  (wipe state)
+#   2. tm-pm start --forever        (background daemon, never auto-exits)
+#   3. open SUPERVISOR window       (your "main brain" — opens FIRST)
+#   4. open PLANNER window          (proposes new tasks)
+#   5. open N EXECUTOR windows      (drain the queue)
+#
+# Usage:
+#   tm-team-up           # 1 supervisor + 1 planner + 1 executor (default)
+#   tm-team-up 2         # ... + 2 executors
+#   tm-team-up 0         # supervisor + planner only, no executor
+#
+# After windows pop up, type `go` in each of them to kick the agent into
+# its role-specific loop.
+set -euo pipefail
+
+N_EXECUTORS="${1:-1}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_Q="${ROOT//\'/\'\\\'\'}"
+
+cd "$ROOT"
+
+echo "── 1. resetting PM state ──"
+./bin/tm-pm reset >/dev/null
+
+echo "── 2. starting pm-daemon (--forever) ──"
+./bin/tm-pm start --forever | tail -n 2
+
+if ! command -v osascript >/dev/null 2>&1; then
+  echo
+  echo "⚠️  osascript not found. Open these windows manually:"
+  echo "  cd '$ROOT' && ./bin/tm-claude-supervisor"
+  echo "  cd '$ROOT' && ./bin/tm-claude-planner"
+  for i in $(seq 1 "$N_EXECUTORS"); do
+    echo "  cd '$ROOT' && ./bin/tm-claude-executor   # executor #$i"
+  done
+  exit 0
+fi
+
+spawn_terminal_window() {
+  osascript -e "tell application \"Terminal\" to do script \"cd '${ROOT_Q}' && $1\"" >/dev/null
+}
+
+echo "── 3. spawning SUPERVISOR window ──"
+spawn_terminal_window "./bin/tm-claude-supervisor"
+sleep 0.4
+
+echo "── 4. spawning PLANNER window ──"
+spawn_terminal_window "./bin/tm-claude-planner"
+sleep 0.4
+
+for i in $(seq 1 "$N_EXECUTORS"); do
+  echo "── 5.$i spawning EXECUTOR #$i window ──"
+  spawn_terminal_window "./bin/tm-claude-executor"
+  sleep 0.3
+done
+
+echo
+echo "✓ team up: 1 supervisor + 1 planner + $N_EXECUTORS executor(s)"
+echo "  every window auto-submits 'go' — agents start working without manual input"
+echo "  monitor real-time:   ./bin/tm-pm watch"
+echo "  monitor event flow:  ./bin/tm-pm tail"
