@@ -344,9 +344,12 @@ class ReusableServer(socketserver.ThreadingTCPServer):
 def main() -> int:
     port = 7891
     open_browser = True
+    strict_port = False
     for arg in sys.argv[1:]:
         if arg == "--no-open":
             open_browser = False
+        elif arg == "--strict-port":
+            strict_port = True
         elif arg.isdigit():
             port = int(arg)
         elif arg in ("-h", "--help"):
@@ -356,8 +359,36 @@ def main() -> int:
             print(f"tm-web: unknown arg {arg!r}", file=sys.stderr)
             return 1
 
+    # Try the requested port; if busy, walk forward up to MAX_TRIES.
+    # --strict-port disables this fallback for scripts that need an exact port.
+    MAX_TRIES = 1 if strict_port else 10
+    server = None
+    last_err = None
+    for attempt in range(MAX_TRIES):
+        try_port = port + attempt
+        try:
+            server = ReusableServer(("127.0.0.1", try_port), Handler)
+            port = try_port
+            break
+        except OSError as e:
+            last_err = e
+            # errno 48 (mac) / 98 (linux) = address in use
+            if e.errno not in (48, 98):
+                # not a port-busy error — bail
+                print(f"tm-web: bind to :{try_port} failed: {e}", file=sys.stderr)
+                return 2
+            if attempt == 0 and not strict_port:
+                print(f"⚠ port {try_port} busy; trying {try_port+1}…", file=sys.stderr)
+
+    if server is None:
+        print(f"tm-web: no free port in {port}..{port+MAX_TRIES-1}: {last_err}",
+              file=sys.stderr)
+        if not strict_port:
+            print("  hint: another tm-web is probably running. Stop it first, or pass --strict-port",
+                  file=sys.stderr)
+        return 3
+
     url = f"http://localhost:{port}/"
-    server = ReusableServer(("127.0.0.1", port), Handler)
     print(f"✓ tm-web listening on {url}  (Ctrl+C to stop)")
     if open_browser:
         # delay so the server is up before the browser hits it
