@@ -165,56 +165,80 @@ LOOP
 
 DIMENSIONS TO CONSIDER (don't declare clean until you've considered ALL)
 
-Once goal.md axes are covered, broaden your search across these layers:
+Eight axes covering BOTH code-quality (Quality A-D) and project-scope
+expansion (Scope E-H). Not every dimension applies to every project —
+a pure library has no UI, a CLI tool may have no integrations — but
+you must EXPLICITLY consider each before declaring clean. Don't silently
+skip dimensions just because the easy ones (A tests, G docs) feel safer.
 
-  A. **Test coverage & quality**
+== Quality (is what's there solid?) ==
+
+  A. **Correctness** — tests, edge cases, error paths
      - Edge cases: empty inputs, unicode, concurrent access, partial failure
      - Negative paths: bad input, missing files, permission denied
      - Property tests / fuzzing for parsers and state machines
-     - Regression tests for any bug surfaced in pm.log / escalations/
+     - Regression tests for any bug surfaced in logs / escalations
 
-  B. **Robustness & error handling**
-     - What happens when claude CLI is missing? When events/ is read-only?
-     - Are timeouts set on every subprocess.run? Bounded retries everywhere?
-     - Atomic writes (.tmp + rename) on every state-mutating script?
+  B. **Robustness** — graceful degradation under bad conditions
+     - What happens when external tools are missing or fail?
+     - Timeouts on every blocking call? Bounded retries everywhere?
+     - Atomic writes (.tmp + rename) for state mutations?
+     - Crash recovery: clean restart after kill -9?
 
-  C. **Observability**
-     - Does pm.log capture WHO did what, not just WHAT happened?
-     - Is tm-pm status enough for someone debugging at 3am? What's missing?
-     - Useful counters: events/sec, tasks/min, stale-rate, escalation-rate.
+  C. **Performance** — speed, scale, resource use
+     - Hot paths: where does the project spend its time?
+     - O(n²) loops that should be O(n log n)? N+1 queries? Cache misses?
+     - Memory leaks, unbounded queues, runaway logs?
+     - Latency budgets respected? Throughput documented?
 
-  D. **Documentation & onboarding**
-     - Is README.md accurate after recent changes? Diagrams stale?
-     - Does CLAUDE.md need updating for new roles / new commands?
-     - Are tunable env vars (PM_FOREVER, TM_PLAN_LOW_TODO, etc.) documented?
+  D. **Security** — input handling, auth, data safety
+     - User-controlled strings flowing into shell / eval / SQL?
+     - Secrets in code / env / logs? Token exposure risk?
+     - File-permission boundaries? Sandbox escapes?
 
-  E. **Refactoring & code health**
-     - Duplicated code (e.g. the same SID-resolution snippet across hooks)?
-     - Shell scripts: shellcheck-clean? bash -n clean (already a test)?
-     - Functions over 50 lines that could split? Magic numbers without names?
+== Scope (what could/should the project ALSO do?) ==
 
-  F. **Security & input handling**
-     - User-controlled strings in event JSON, task summaries, signal_cmd?
-     - Shell injection in any os.system / bash -c / eval site?
+  E. **Features & capabilities** — what's missing that users would want?
+     - New commands / endpoints / flows the project doesn't yet support
+     - Capabilities that are 80% there but need finishing (e.g. has 'shutdown'
+       and 'gc' — should it have 'rollback'? 'replay'? 'export'?)
+     - Workflow gaps: 5 manual steps that could be 1 command
 
-  G. **Operational ergonomics**
-     - tm-pm subcommands missing for common ops? (e.g. tail-with-filter,
-       export-state, replay-events, snapshot/restore.)
-     - Convenience: keyboard shortcuts, status-line additions, error
-       messages that suggest fixes.
+  F. **UI / UX** — how humans interact with it
+     - CLI: error messages clear and actionable? --help complete?
+       autocomplete possible? colors readable on light AND dark backgrounds?
+     - Web/desktop UI: layout, accessibility, mobile-responsive, i18n
+     - Status displays: is current state visible without invoking commands?
+     - Feedback loops: does the user know when something's working?
+
+  G. **Documentation & developer experience**
+     - README accurate after recent changes? Diagrams stale?
+     - Quick-start path: stranger up and running in <5 min?
+     - API/interface docs: every public function/flag documented?
+     - Examples directory? Common-task tutorials?
+     - Tunable knobs (env vars, config flags) all documented with defaults?
+
+  H. **Distribution & integrations** — how it ships and connects
+     - Install: one-command? Package manager? Docker? brew?
+     - Releases: tagged versions? changelog? semver?
+     - Integrations: should it talk to Slack / GitHub / S3 / cloud APIs?
+       Are those integrations isolated and testable?
+     - Cross-platform: Linux/macOS/Windows? Node/Python version matrix?
 
 CLEAN IS A HIGH BAR
 
 \`tm-plan-cycle clean\` is not a default. It's an assertion. Before declaring
 clean you MUST first enumerate at least 3 candidate improvements (by
-DIMENSIONS letter — A through G), then explicitly argue why each is
+DIMENSIONS letter — A through H), then explicitly argue why each is
 genuinely low-leverage right now. Only after that, if no candidate
 clears the bar, declare clean. Format your reason like:
 
   "candidates considered: (A) edge-case test for parse_plan continuation
-   indentation — already covered by test_parse_plan.py:42; (B) timeout on
-   tm-review subprocess — already 180s; (E) dedupe SID-resolution across
-   3 hooks — saves 12 lines, low impact. None high-leverage; clean."
+   indentation — already covered by test_parse_plan.py:42; (E) add
+   tm-pm replay subcommand to re-process events/.processed/ — niche,
+   low ROI; (F) tm-pm watch's color palette is illegible on light
+   terminals — low priority, defer; (H) brew formula — premature for
+   this stage. None high-leverage; clean."
 
 If you can't list 3, you haven't looked hard enough — ADD a task instead.
 Clean-streak ≥ 3 is a signal to LOOK HARDER (different dimension), not
