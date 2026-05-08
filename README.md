@@ -42,6 +42,8 @@
 | L6 | Goal 自动演进 | `tm-supervise revise-goal` + version snapshot |
 | 创新通道 | 人/LLM 双源注入野心 | `vision.md`（你写）+ `tm-vision propose`（LLM brainstorm）→ supervisor 决定何时 promote |
 
+> **关于 L7**：你可能预期 ladder 应该有 L7（跨项目编排）。**故意没加**。L7 不是 L6 的自然延续，是不同类别的问题（多租户、跨项目状态汇聚），架构上需要重写底座。99% 的「我有多个项目都想自动管」用例，**跑 N 次 `tm-init` + `tm-team-up` 各自独立运行**就解决了 —— 这其实就是简化版的 L7，零额外代码。真要做完整 L7 是另一个项目（多租户 SaaS），不是这个 framework 的下一个版本。
+
 ## 创新性的限制（坦诚说）
 
 这套系统**擅长 gap-filling，不擅长 invention**：planner 看 manifest 找漏洞、补测试、硬化代码。但它**不能**自己想到「这项目其实可以变成 SaaS / 加 web UI / 跨项目编排」这种跳脱当前 scope 的方向。
