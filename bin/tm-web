@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""tm-web — browser version of `tm-pm watch`.
+
+Serves a single-page dashboard that polls /api/state every second,
+showing live PM state, recent events, escalations, status reports,
+decisions. All data is read-only from the project's runtime files.
+
+Stdlib only — no Flask, no React, no build step. Just python http.server.
+
+Usage:
+  tm-web                # listen on :7891 (default), open in browser
+  tm-web 8080           # listen on :8080
+  tm-web --no-open      # don't auto-launch browser
+"""
+from __future__ import annotations
+
+import datetime
+import http.server
+import json
+import os
+import re
+import socketserver
+import sys
+import threading
+import urllib.parse
+import webbrowser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE_FILE = ROOT / "pm-state.json"
+LOG_FILE = ROOT / "pm.log"
+SUPERVISOR_LOG = ROOT / "supervisor.log"
+ESC_DIR = ROOT / "escalations"
+DECISIONS_DIR = ROOT / "decisions"
+STATUS_REPORTS_DIR = ROOT / "status-reports"
+PROPOSALS_DIR = ROOT / "proposals"
+PID_FILE = ROOT / "pm.pid"
+
+
+def daemon_running() -> bool:
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def read_state() -> dict:
+    if not STATE_FILE.exists():
+        return {"tasks": [], "workers": {}}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {"tasks": [], "workers": {}}
+
+
+def tail_log(path: Path, n: int = 30) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        return path.read_text(errors="ignore").splitlines()[-n:]
+    except Exception:
+        return []
+
+
+def list_dir_md(d: Path, n: int = 8) -> list[dict]:
+    if not d.is_dir():
+        return []
+    items = sorted(
+        (p for p in d.iterdir() if p.is_file() and p.suffix == ".md"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:n]
+    out = []
+    for p in items:
+        try:
+            first = p.read_text(errors="ignore").splitlines()[0]
+        except Exception:
+            first = "(unreadable)"
+        title = first.lstrip("# ").strip() or p.stem
+        out.append({"name": p.name, "title": title})
+    return out
+
+
+INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tm-web · ZeroProgramer dashboard</title>
+<style>
+  :root { --bg:#0e1116; --fg:#e6edf3; --muted:#7d8590; --green:#3fb950; --red:#f85149; --yellow:#d29922; --blue:#58a6ff; --magenta:#bc8cff; --card:#161b22; --border:#30363d; }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); font-family: -apple-system,SF Mono,Menlo,Consolas,monospace; margin:0; padding:1.5rem; font-size:13px; line-height:1.5; }
+  h1 { margin:0 0 .5rem; font-size:1.2rem; }
+  h2 { margin:1.2rem 0 .5rem; font-size:1rem; color:var(--muted); border-bottom:1px solid var(--border); padding-bottom:.3rem; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:1rem; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:6px; padding:1rem; }
+  .card h2 { margin-top:0; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; }
+  .pill.green { background:rgba(63,185,80,.15); color:var(--green); }
+  .pill.red { background:rgba(248,81,73,.15); color:var(--red); }
+  .pill.yellow { background:rgba(210,153,34,.15); color:var(--yellow); }
+  .pill.blue { background:rgba(88,166,255,.15); color:var(--blue); }
+  .pill.muted { background:rgba(125,133,144,.15); color:var(--muted); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { padding:.4rem .5rem; text-align:left; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { color:var(--muted); font-weight:normal; font-size:11px; text-transform:uppercase; }
+  tr:last-child td { border-bottom:none; }
+  pre { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:.6rem; margin:0; overflow-x:auto; max-height:200px; font-size:11px; line-height:1.4; }
+  .mono { font-family:inherit; }
+  .truncate { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:480px; }
+  .small { color:var(--muted); font-size:11px; }
+  .header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:1rem; }
+  .dot.green { color:var(--green); }
+  .dot.muted { color:var(--muted); }
+  .role-supervisor { color:var(--magenta); }
+  .role-planner { color:var(--blue); }
+  .role-executor { color:var(--green); }
+  .role-default { color:var(--muted); }
+  ul { margin: .3rem 0; padding-left: 1.2rem; }
+  li { margin: .2rem 0; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1 id="proj">— · loading…</h1>
+    <div class="small">refreshes every 1s · <span id="ts">—</span></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Progress</h2>
+      <div id="progress"></div>
+    </div>
+
+    <div class="card">
+      <h2>Workers</h2>
+      <table id="workers-table"><tbody></tbody></table>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Tasks</h2>
+      <table id="tasks-table">
+        <thead><tr><th>#</th><th>status</th><th>title</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Recent PM events</h2>
+      <pre id="recent-events">—</pre>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Open escalations</h2>
+      <ul id="escalations"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Recent supervisor decisions</h2>
+      <pre id="supervisor-log">—</pre>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Status reports</h2>
+      <ul id="status-reports"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Decisions log (ADR)</h2>
+      <ul id="decisions"></ul>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Vision proposals (awaiting supervisor review)</h2>
+      <ul id="proposals"></ul>
+    </div>
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/state");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    render(s);
+  } catch (e) {
+    $("proj").textContent = "(server unreachable)";
+  }
+}
+
+function render(s) {
+  const dot = s.daemon_running ? '<span class="dot green">●</span>' : '<span class="dot muted">○</span>';
+  $("proj").innerHTML = `${dot} ${s.project} <span class="small">· role-aware multi-agent dashboard</span>`;
+  $("ts").textContent = new Date().toLocaleTimeString();
+
+  const ts = s.tasks || [];
+  const done = ts.filter(t => t.status === "done").length;
+  const inpg = ts.filter(t => t.status === "in-progress").length;
+  const fail = ts.filter(t => t.status === "failed").length;
+  const todo = ts.length - done - inpg - fail;
+  const pct = ts.length ? Math.round(100 * done / ts.length) : 0;
+  $("progress").innerHTML = `
+    <div style="font-size:1.5rem; margin-bottom:.5rem;">${done}<span class="small">/${ts.length}</span> <span class="pill ${done === ts.length && ts.length ? 'green' : 'blue'}">${pct}%</span></div>
+    <div>
+      <span class="pill green">${done} done</span>
+      <span class="pill yellow">${inpg} in-progress</span>
+      <span class="pill muted">${todo} todo</span>
+      ${fail ? `<span class="pill red">${fail} failed</span>` : ""}
+    </div>
+  `;
+
+  // workers
+  const wTbody = $("workers-table").querySelector("tbody");
+  const ws = s.workers || {};
+  const wEntries = Object.entries(ws);
+  if (!wEntries.length) {
+    wTbody.innerHTML = '<tr><td colspan="4" class="small">(no workers registered)</td></tr>';
+  } else {
+    wTbody.innerHTML = wEntries.map(([sid, w]) => {
+      const role = w.role || "executor";
+      const cur = w.current_task_id != null ? `task #${w.current_task_id}` : "—";
+      return `<tr>
+        <td class="mono">${sid.slice(0,12)}</td>
+        <td class="role-${role}">${role}</td>
+        <td>${w.status}</td>
+        <td>${cur}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  // tasks
+  const tTbody = $("tasks-table").querySelector("tbody");
+  if (!ts.length) {
+    tTbody.innerHTML = '<tr><td colspan="3" class="small">(no tasks)</td></tr>';
+  } else {
+    const mark = { done:"✓", "in-progress":"▶", failed:"✗", todo:"·" };
+    tTbody.innerHTML = ts.slice(-15).map(t => {
+      const cls = t.status === "done" ? "green" : t.status === "in-progress" ? "yellow" : t.status === "failed" ? "red" : "muted";
+      return `<tr>
+        <td>#${t.id}</td>
+        <td><span class="pill ${cls}">${mark[t.status] || "?"} ${t.status}</span></td>
+        <td class="truncate" title="${escape_html(t.title || "")}">${escape_html(t.title || "")}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  // recent events
+  $("recent-events").textContent = (s.recent_events || []).join("\\n") || "(no events)";
+
+  // escalations
+  const escUl = $("escalations");
+  const escs = s.escalations || [];
+  escUl.innerHTML = escs.length ? escs.map(e => `<li class="mono">${escape_html(e.name)} — ${escape_html(e.title)}</li>`).join("") : '<li class="small">(none) ✓</li>';
+
+  // supervisor log
+  $("supervisor-log").textContent = (s.supervisor_recent || []).join("\\n") || "(no supervisor decisions yet)";
+
+  // status reports
+  const srUl = $("status-reports");
+  const srs = s.status_reports || [];
+  srUl.innerHTML = srs.length ? srs.map(r => `<li class="mono">${escape_html(r.name)}</li>`).join("") : '<li class="small">(none yet)</li>';
+
+  // decisions
+  const dUl = $("decisions");
+  const ds = s.decisions || [];
+  dUl.innerHTML = ds.length ? ds.map(d => `<li class="mono">${escape_html(d.name)} — ${escape_html(d.title)}</li>`).join("") : '<li class="small">(none yet)</li>';
+
+  // proposals
+  const pUl = $("proposals");
+  const ps = s.proposals || [];
+  pUl.innerHTML = ps.length ? ps.map(p => `<li class="mono">${escape_html(p.name)} — ${escape_html(p.title)}</li>`).join("") : '<li class="small">(none — try ./bin/tm-vision propose)</li>';
+}
+
+function escape_html(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a, **kw):
+        pass  # silence default access logs
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/" or path == "/index.html":
+            return self._send(200, "text/html; charset=utf-8", INDEX_HTML.encode())
+        if path == "/api/state":
+            payload = self._build_state()
+            return self._send(200, "application/json",
+                              json.dumps(payload).encode())
+        return self._send(404, "text/plain", b"not found")
+
+    def _send(self, code, ctype, body):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _build_state(self) -> dict:
+        s = read_state()
+        return {
+            "project": ROOT.name,
+            "daemon_running": daemon_running(),
+            "tasks": s.get("tasks", []),
+            "workers": s.get("workers", {}),
+            "recent_events": tail_log(LOG_FILE, 20),
+            "supervisor_recent": tail_log(SUPERVISOR_LOG, 8),
+            "escalations": list_dir_md(ESC_DIR, 10),
+            "status_reports": list_dir_md(STATUS_REPORTS_DIR, 8),
+            "decisions": list_dir_md(DECISIONS_DIR, 8),
+            "proposals": list_dir_md(PROPOSALS_DIR, 8),
+            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+
+
+class ReusableServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+
+def main() -> int:
+    port = 7891
+    open_browser = True
+    for arg in sys.argv[1:]:
+        if arg == "--no-open":
+            open_browser = False
+        elif arg.isdigit():
+            port = int(arg)
+        elif arg in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            print(f"tm-web: unknown arg {arg!r}", file=sys.stderr)
+            return 1
+
+    url = f"http://localhost:{port}/"
+    server = ReusableServer(("127.0.0.1", port), Handler)
+    print(f"✓ tm-web listening on {url}  (Ctrl+C to stop)")
+    if open_browser:
+        # delay so the server is up before the browser hits it
+        threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n✓ tm-web stopped")
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

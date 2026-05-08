@@ -25,6 +25,7 @@
       "Bash(./bin/tm-risk-list:*)",
       "Bash(./bin/tm-vision:*)",
       "Bash(./bin/tm-github-sync:*)",
+      "Bash(./bin/tm-web:*)",
       "Bash(tm-pm:*)",
       "Bash(tm-done:*)",
       "Bash(tm-plan-cycle:*)",

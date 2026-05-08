@@ -126,7 +126,8 @@ cp -r ~/source/* workspace/           # populate workspace with code to be manag
 ### Monitor (run in any spare terminal — zero token cost)
 
 ```bash
-./bin/tm-pm watch                 # 1Hz live dashboard
+./bin/tm-pm watch                 # 1Hz terminal dashboard
+./bin/tm-web                      # 1Hz browser dashboard at http://localhost:7891
 ./bin/tm-pm status                # one-shot snapshot
 ./bin/tm-pm tail                  # live PM event log
 ./bin/tm-status-report            # generate markdown report under status-reports/
@@ -300,6 +301,8 @@ bin/
 ├── tm-done                   # executor CLI
 ├── tm-context                # task / history queries
 ├── tm-vision                 # innovation channel: add / propose / list / show / edit
+├── tm-github-sync            # mirror escalations to GitHub Issues
+├── tm-web                    # browser dashboard (single-page, polls /api/state)
 ├── tm-title-keeper           # live window-title refresher
 ├── tm-status-title           # title bar text generator
 ├── tm-statusline             # Claude Code statusLine command
