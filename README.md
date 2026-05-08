@@ -257,4 +257,4 @@ bin/
 
 构建于 [Claude Code](https://claude.com/claude-code)。设计灵感来自 agent-self-iteration 项目（同 repo 上一代的单 agent 自循环器）。
 
-License: 自定 (TODO)
+License: [MIT](LICENSE)
