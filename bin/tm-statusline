@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Claude Code statusLine: project name, plan progress, worker count, current task.
 
-Reads pm-state.json + plan.md. Stdout becomes the line at the bottom of Claude
-Code's interactive terminal UI. Should print one line, fast (<100ms).
+Reads pm-state.json. Project name comes from TM_PROJECT_NAME env var or
+the project directory's basename. Stdout becomes the line at the bottom
+of Claude Code's interactive terminal UI. Should print one line, fast (<100ms).
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -17,18 +17,18 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def project_name() -> str:
-    plan = ROOT / "plan.md"
-    if not plan.exists():
-        return "(no plan)"
-    for raw in plan.read_text().splitlines():
-        line = raw.strip()
-        if not line.startswith("#"):
-            continue
-        # accept: "# Project: Foo", "# Project plan: Foo", "# Foo"
-        m = re.match(r"^#+\s*(?:Project(?:\s+plan)?\s*:\s*)?(.+?)\s*$", line)
-        if m and m.group(1):
-            return m.group(1).strip()
-    return "(unnamed)"
+    # Priority:
+    #   1. TM_PROJECT_NAME env var (explicit override)
+    #   2. directory basename (works for any repo: claude-team-demo,
+    #      my-app, your-project — whatever the user named the dir)
+    # We deliberately DON'T parse plan.md anymore: the planner agent
+    # generates plan titles like "PM Daemon Worker Loop" that look like
+    # leaked internals to anyone watching the status line. The project
+    # name should be stable across all plans.
+    env = os.environ.get("TM_PROJECT_NAME", "").strip()
+    if env:
+        return env
+    return ROOT.name
 
 
 def daemon_running() -> bool:

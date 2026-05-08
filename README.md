@@ -252,6 +252,7 @@ When tokens run out: planner / executor calls fail → escalations → superviso
 | `NAG_AFTER_SEC` | 40 | Seconds of work before PM nags a worker |
 | `TM_PLAN_CLEAN_COOLDOWN` | 300 | After "clean" verdict, planner waits this long before re-evaluating |
 | `SUPERVISE_INTERVAL` | 600 | Seconds between supervisor patrol cycles |
+| `TM_PROJECT_NAME` | (dir basename) | Override the project name shown in statusLine + window title (otherwise uses the directory name) |
 | `TM_TITLE_INTERVAL` | 2 | Title bar refresh frequency (s) |
 | `PLANNER_INTERVAL` | 60 | Pace for the bash-based `tm-planner` daemon |
 | `TM_MODEL_VERIFIER` | (claude default) | Model for deterministic checks (`tm-review`, `tm-goal-review`). Recommend a cheap fast model: `claude-haiku-4-5-20251001` |
