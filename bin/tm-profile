@@ -31,26 +31,62 @@ fi
 GOAL_TXT=""
 [ -f "$ROOT/goal.md" ] && GOAL_TXT=$(cat "$ROOT/goal.md")
 
-prompt="You are a code auditor. Read the project under \`$WORKSPACE\` and decide which project-specific dimensions of quality genuinely matter for THIS code, then WRITE the result to \`$MANIFEST\` using your Write tool.
+prompt="You are a code auditor. Read the project under \`$WORKSPACE\` and decide which dimensions of quality genuinely matter for THIS specific code — then WRITE the result to \`$MANIFEST\` using your Write tool.
 
 PROJECT GOAL (if any):
 ---
 $GOAL_TXT
 ---
 
+CANDIDATE DIMENSION POOL (pick what ACTUALLY applies; skip the rest)
+
+This is a hint list, not a checklist. A pure library has no UI, a CLI
+tool may need no integrations, a script doesn't need distribution. Pick
+ONLY the dimensions that genuinely matter for what THIS code is and
+does. Inventing dimensions that don't fit is worse than omitting them.
+
+Quality (does what's there work well?):
+  - correctness          tests / edge cases / error paths
+  - robustness           graceful failure / timeouts / atomic writes
+  - performance          hot-path speed / memory / scale (only if size matters)
+  - security             input handling / shell-injection / secrets / auth
+  - concurrency_safety   race conditions / locking / atomicity (only if concurrent)
+
+Scope (what does this project also need to do?):
+  - features             capability gaps users would obviously want
+  - ui_ux                CLI ergonomics / web UI / a11y / i18n (ONLY if user-facing)
+  - documentation        README / API docs / tutorials / examples
+  - distribution         packaging / install / releases / cross-platform
+  - integrations         third-party APIs / cloud / message buses (only if applicable)
+  - data_model           schema / migrations / contracts (only if data-heavy)
+
+Domain-specific (PRIORITIZE these — they're often where the real leverage is):
+  Identify dimensions that come from THIS project's domain. Examples by
+  project type:
+    - Game engine:        frame_pacing, input_latency, asset_streaming
+    - Audio app:          audio_latency, sync_drift, codec_compatibility
+    - Compiler:           spec_compliance, error_message_quality, optimization_opportunities
+    - Web service:        request_throughput, p99_latency, db_n_plus_one
+    - Physics sim:        numerical_stability, conservation_laws, boundary_conditions
+    - ML pipeline:        data_validation, training_reproducibility, eval_coverage
+  Project-specific dimensions almost always beat generic ones in leverage.
+
 Steps:
 1. Read efficiently — README, main source files, tests. Don't recurse deeply.
-2. Probe each candidate dimension with concrete commands (run pytest, grep for patterns, etc.) so 'satisfied' reflects reality.
-3. Use the Write tool to write a JSON file at exactly \`$MANIFEST\` with this schema:
+2. Look at what kind of project this is. Pick 3-7 dimensions that ACTUALLY
+   matter for it. Mix domain-specific (1-2) + relevant generic ones.
+3. Probe each candidate dimension with concrete commands (run pytest, grep
+   for patterns, etc.) so 'satisfied' reflects reality.
+4. Use the Write tool to write JSON to \`$MANIFEST\` with this schema:
 
 {
-  \"project_kind\": \"<one short sentence>\",
+  \"project_kind\": \"<one short sentence describing what this project IS>\",
   \"dimensions\": [
     {
       \"name\": \"<short_snake_case>\",
       \"why\": \"<one sentence — why this dimension matters for THIS project>\",
       \"what_to_audit\": \"<concrete things to look for in code>\",
-      \"signal_cmd\": \"<shell command, runnable from $WORKSPACE, exit 0 ⇒ this dimension is satisfied>\",
+      \"signal_cmd\": \"<shell command, runnable from $WORKSPACE, exit 0 ⇒ satisfied>\",
       \"current_state\": \"<one short sentence — what you observed>\",
       \"satisfied\": true
     }
@@ -58,12 +94,17 @@ Steps:
 }
 
 Rules:
-- 3-7 dimensions. Pick the ones with most leverage for THIS project, not a generic checklist.
-- signal_cmd is a real shell command whose exit code is the truth. Prefer simple commands: \`grep -q 'pattern' file\`, \`python3 -m pytest -q -k keyword\`, \`test -f file\`. Avoid python -c with embedded quotes — they are hard to escape inside JSON.
-- Set satisfied=true ONLY if you actually ran the signal_cmd and it exited 0. Be honest — false is more useful than wishful true.
-- If a dimension can't be expressed as a single, simple command, omit it.
+- 3-7 dimensions. Quality > quantity. SKIP dimensions that don't apply
+  to this project (e.g. UI for a Python library, distribution for a
+  one-off script).
+- signal_cmd is a real shell command whose exit code is the truth.
+  Prefer simple: \`grep -q 'pattern' file\`, \`pytest -q -k name\`, \`test -f file\`.
+  Avoid \`python -c\` with embedded quotes — hard to escape in JSON.
+- Set satisfied=true ONLY if you actually ran the signal_cmd and it
+  exited 0. False is more useful than wishful true.
+- If a dimension can't be expressed as a single simple command, omit it.
 
-After Write succeeds, reply with one line: 'manifest written'. No further prose, no JSON in text."
+After Write succeeds, reply with one line: 'manifest written'. No further prose."
 
 echo "▸ profiling $WORKSPACE … (claude -p will Write the manifest)" >&2
 log=$(mktemp -t tm-profile.XXXXXX)

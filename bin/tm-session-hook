@@ -145,15 +145,28 @@ the project clean only after a thorough multi-dimensional sweep.
 LOOP
 
 1. Inspect the project to decide whether one new task is worth proposing:
-   - Read goal.md (project intent — but don't be limited to it once those
-     axes are covered).
-   - Run \`tm-context list\` (or \`tm-context done\` / \`tm-context show <id>\`)
-     to see what's been done / failed / is in flight.
+   - Read goal.md (project intent).
+   - **Read manifest.json** (project-DERIVED dimensions). This file is
+     produced by tm-profile and contains 3-7 dimensions tailored to THIS
+     specific codebase — not a generic checklist. Each has a signal_cmd
+     and a satisfied:bool. If manifest.json:
+       - **doesn't exist**: run \`./bin/tm-profile --force\` once, wait
+         for "manifest with N dimensions", then re-read.
+       - **has unsatisfied dimensions**: those are your top candidates.
+         They beat generic dimensions because they're tuned to this project.
+       - **all satisfied AND > 30 min old AND ≥ 5 tasks done since last
+         refresh**: consider running tm-profile --force to discover new
+         dimensions the project may have grown into.
+   - Run \`tm-context list\` to see what's been done / failed / in flight.
    - Inspect workspace/ with Read / Bash / Grep as needed. DON'T edit files.
 
 2. Decide one of:
      (a) ONE concrete improvement worth doing now → call:
            tm-plan-cycle add "<imperative one-line task title>" "<signal_cmd>"
+         **PRIORITY ORDER for picking**:
+           1. Unsatisfied manifest.json dimension (project-specific).
+           2. Goal.md axis not yet covered.
+           3. Generic dimension (A-H below) — fallback only.
          signal_cmd is a shell command run from workspace/ that exits 0
          iff the gap is closed (e.g. \`pytest -k foo\`, \`grep -q PATTERN file\`).
      (b) Nothing useful left → call:
@@ -163,82 +176,39 @@ LOOP
    or a 5 minute cooldown elapses for clean verdicts. Then print fresh
    status and exit. Loop back to step 1.
 
-DIMENSIONS TO CONSIDER (don't declare clean until you've considered ALL)
+DIMENSIONS COME FROM THE PROJECT, NOT A FIXED LIST
 
-Eight axes covering BOTH code-quality (Quality A-D) and project-scope
-expansion (Scope E-H). Not every dimension applies to every project —
-a pure library has no UI, a CLI tool may have no integrations — but
-you must EXPLICITLY consider each before declaring clean. Don't silently
-skip dimensions just because the easy ones (A tests, G docs) feel safer.
+manifest.json (produced by tm-profile) names 3-7 dimensions tailored to
+THIS specific project — picked from a candidate pool that includes
+correctness/robustness/performance/security/features/UI/docs/distribution/
+integrations/data_model AND project-domain specifics (e.g. frame_pacing
+for a game, audio_latency for an audio app, numerical_stability for a
+physics sim). Dimensions that don't apply to this project (UI for a
+library, distribution for a one-off script) ARE NOT in the manifest.
 
-== Quality (is what's there solid?) ==
+This means: **you only audit what actually matters for this code**.
+You don't burn a turn checking UI on a pure library, or asking about
+schema migrations on a stateless tool.
 
-  A. **Correctness** — tests, edge cases, error paths
-     - Edge cases: empty inputs, unicode, concurrent access, partial failure
-     - Negative paths: bad input, missing files, permission denied
-     - Property tests / fuzzing for parsers and state machines
-     - Regression tests for any bug surfaced in logs / escalations
-
-  B. **Robustness** — graceful degradation under bad conditions
-     - What happens when external tools are missing or fail?
-     - Timeouts on every blocking call? Bounded retries everywhere?
-     - Atomic writes (.tmp + rename) for state mutations?
-     - Crash recovery: clean restart after kill -9?
-
-  C. **Performance** — speed, scale, resource use
-     - Hot paths: where does the project spend its time?
-     - O(n²) loops that should be O(n log n)? N+1 queries? Cache misses?
-     - Memory leaks, unbounded queues, runaway logs?
-     - Latency budgets respected? Throughput documented?
-
-  D. **Security** — input handling, auth, data safety
-     - User-controlled strings flowing into shell / eval / SQL?
-     - Secrets in code / env / logs? Token exposure risk?
-     - File-permission boundaries? Sandbox escapes?
-
-== Scope (what could/should the project ALSO do?) ==
-
-  E. **Features & capabilities** — what's missing that users would want?
-     - New commands / endpoints / flows the project doesn't yet support
-     - Capabilities that are 80% there but need finishing (e.g. has 'shutdown'
-       and 'gc' — should it have 'rollback'? 'replay'? 'export'?)
-     - Workflow gaps: 5 manual steps that could be 1 command
-
-  F. **UI / UX** — how humans interact with it
-     - CLI: error messages clear and actionable? --help complete?
-       autocomplete possible? colors readable on light AND dark backgrounds?
-     - Web/desktop UI: layout, accessibility, mobile-responsive, i18n
-     - Status displays: is current state visible without invoking commands?
-     - Feedback loops: does the user know when something's working?
-
-  G. **Documentation & developer experience**
-     - README accurate after recent changes? Diagrams stale?
-     - Quick-start path: stranger up and running in <5 min?
-     - API/interface docs: every public function/flag documented?
-     - Examples directory? Common-task tutorials?
-     - Tunable knobs (env vars, config flags) all documented with defaults?
-
-  H. **Distribution & integrations** — how it ships and connects
-     - Install: one-command? Package manager? Docker? brew?
-     - Releases: tagged versions? changelog? semver?
-     - Integrations: should it talk to Slack / GitHub / S3 / cloud APIs?
-       Are those integrations isolated and testable?
-     - Cross-platform: Linux/macOS/Windows? Node/Python version matrix?
+If manifest.json is missing or stale, regenerate it via tm-profile —
+don't try to invent dimensions yourself.
 
 CLEAN IS A HIGH BAR
 
 \`tm-plan-cycle clean\` is not a default. It's an assertion. Before declaring
-clean you MUST first enumerate at least 3 candidate improvements (by
-DIMENSIONS letter — A through H), then explicitly argue why each is
-genuinely low-leverage right now. Only after that, if no candidate
-clears the bar, declare clean. Format your reason like:
+clean you MUST first enumerate at least 3 candidate improvements grounded
+in (a) unsatisfied manifest.json dimensions, (b) goal.md axes, or
+(c) concrete observations from reading workspace/. Then explicitly argue
+why each is genuinely low-leverage right now. Format your reason like:
 
-  "candidates considered: (A) edge-case test for parse_plan continuation
-   indentation — already covered by test_parse_plan.py:42; (E) add
-   tm-pm replay subcommand to re-process events/.processed/ — niche,
-   low ROI; (F) tm-pm watch's color palette is illegible on light
-   terminals — low priority, defer; (H) brew formula — premature for
-   this stage. None high-leverage; clean."
+  "candidates considered:
+   (manifest.daemon_resilience) crash-recovery test — already covered by
+     test_daemon_resilience.py;
+   (manifest.atomic_event_writes) double-check tm-auto-loop's writer —
+     verified mv-rename pattern present;
+   (goal.md axis 3) README Tuning section incomplete — but PR-sized,
+     not high-leverage right now.
+   None high-leverage; clean."
 
 If you can't list 3, you haven't looked hard enough — ADD a task instead.
 Clean-streak ≥ 3 is a signal to LOOK HARDER (different dimension), not

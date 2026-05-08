@@ -35,7 +35,7 @@
 |---|---|---|
 | L0 | 单 agent 干活 | 一个 Claude 窗口 |
 | L1 | 多 agent 并发 | PM 派活给多个 executor，文件邮箱通信无锁 |
-| L2 | Planner 持续生成新 task | `tm-claude-planner` + 8 维度扫描（含 UI/feature/perf/distribution）+ 5min cooldown |
+| L2 | Planner 持续生成新 task | `tm-profile` 写项目专属 manifest.json + planner 据此找事 + 5min clean cooldown |
 | L3 | Supervisor 元决策 | `tm-claude-supervisor` + 周报 + 决策日志 |
 | L4 | Agent 改自己源码 | executor 在 workspace/ 编辑产品代码 |
 | L5 | 改动自动同步到 production | `tm-promote` 带 stale-snapshot 检测 |
@@ -44,9 +44,12 @@
 PM 角色：
 - **PM (Python daemon)** — 派活、跟踪、GC、escalation 升级。零 token。
 - **SUPERVISOR (Claude)** — 项目经理：写周报、记决策、改方向、决定停。
-- **PLANNER (Claude)** — 持续找事：跨 8 维度扫薄弱点和扩展机会。
-  - **Quality**: A 正确性 / B 鲁棒性 / C 性能 / D 安全
-  - **Scope**: E 新功能 / F UI&UX / G 文档 / H 分发&集成
+- **PLANNER (Claude)** — 持续找事。**维度从项目自身导出**：`tm-profile`
+  读 workspace/ 后写 `manifest.json`，里面的 3-7 个 dimension 是对
+  THIS project 量身的（候选池含 correctness/robustness/perf/security/
+  features/UI/docs/distribution/integrations/data_model，以及项目领域
+  专属如 frame_pacing / audio_latency / numerical_stability）。**不适用
+  的维度不进 manifest，不浪费 token 审计**。Planner 只读 manifest 工作。
 - **EXECUTOR × N (Claude)** — 真动手改代码的 agent。可并行多个。
 
 ---
