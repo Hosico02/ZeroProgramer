@@ -324,6 +324,12 @@ bin/
 
 ---
 
+## Documentation
+
+- **[Tutorial](docs/TUTORIAL.md)** — end-to-end walkthrough from clone to first run (~20 min)
+- **[Contributing](CONTRIBUTING.md)** — PR guidelines + architecture invariants
+- **[README.zh.md](README.zh.md)** — Chinese version
+
 ## Acknowledgments
 
 Built on [Claude Code](https://claude.com/claude-code). Design inspired by `agent-self-iteration` (the previous-generation single-agent self-iterator from the same family).
