@@ -254,6 +254,18 @@ When tokens run out: planner / executor calls fail → escalations → superviso
 | `SUPERVISE_INTERVAL` | 600 | Seconds between supervisor patrol cycles |
 | `TM_TITLE_INTERVAL` | 2 | Title bar refresh frequency (s) |
 | `PLANNER_INTERVAL` | 60 | Pace for the bash-based `tm-planner` daemon |
+| `TM_MODEL_VERIFIER` | (claude default) | Model for deterministic checks (`tm-review`, `tm-goal-review`). Recommend a cheap fast model: `claude-haiku-4-5-20251001` |
+| `TM_MODEL_CREATIVE` | (claude default) | Model for creative work (`tm-profile`, `tm-assess`, `tm-vision`, `tm-plan`, `tm-auto-loop`). Use the strong default unless you want to test a specific version. |
+
+### Multi-LLM cost optimization
+
+Verifier calls (PASS/FAIL grading, DONE/CONTINUE judgment) are deterministic checks that don't need a top-tier model. Routing them to a cheap fast model can halve total token spend without quality loss:
+
+```bash
+# Cheap model for verification, default for creative work
+export TM_MODEL_VERIFIER=claude-haiku-4-5-20251001
+./bin/tm-team-up 2
+```
 
 ---
 

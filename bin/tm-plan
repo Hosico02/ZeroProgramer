@@ -111,7 +111,9 @@ Output now:"
 fi
 
 echo "▸ asking claude to generate plan ($mode mode) …" >&2
-claude -p "$prompt" > "$PLAN.tmp"
+model_args=()
+[ -n "${TM_MODEL_CREATIVE:-}" ] && model_args=(--model "$TM_MODEL_CREATIVE")
+claude -p "${model_args[@]}" "$prompt" > "$PLAN.tmp"
 
 python3 - "$PLAN.tmp" "$PLAN" <<'PY'
 import sys

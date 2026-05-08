@@ -37,7 +37,9 @@ Reply with EXACTLY one JSON object on a single line, nothing else:
 
 Output now:"
 
-raw=$(claude -p --allowedTools "Read,Bash,Grep,Glob" "$prompt" 2>/dev/null || true)
+model_args=()
+[ -n "${TM_MODEL_VERIFIER:-}" ] && model_args=(--model "$TM_MODEL_VERIFIER")
+raw=$(claude -p "${model_args[@]}" --allowedTools "Read,Bash,Grep,Glob" "$prompt" 2>/dev/null || true)
 
 # Extract the JSON object from claude's reply (it might wrap it in prose / fences).
 python3 - <<PY

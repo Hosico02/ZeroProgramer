@@ -93,7 +93,9 @@ Begin."
 
 echo "▸ assessor running …" >&2
 log=$(mktemp -t tm-assess.XXXXXX)
-TM_AUTO=1 claude -p \
+model_args=()
+[ -n "${TM_MODEL_CREATIVE:-}" ] && model_args=(--model "$TM_MODEL_CREATIVE")
+TM_AUTO=1 claude -p "${model_args[@]}" \
   --allowedTools "Read,Bash,Grep,Glob,Write" \
   --append-system-prompt "Be concise. Use tools. End by writing exactly one event file and replying 'event written'." \
   "$prompt" >"$log" 2>&1 || true

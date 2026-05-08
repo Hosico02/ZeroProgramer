@@ -200,7 +200,9 @@ Begin."
 
     echo "▸ tm-vision propose: asking claude for $n ambitious proposal(s)..." >&2
     log=$(mktemp -t tm-vision.XXXXXX)
-    TM_AUTO=1 claude -p \
+    model_args=()
+    [ -n "${TM_MODEL_CREATIVE:-}" ] && model_args=(--model "$TM_MODEL_CREATIVE")
+    TM_AUTO=1 claude -p "${model_args[@]}" \
       --allowedTools "Read,Bash,Grep,Glob,Write" \
       --append-system-prompt "Be concise. Use Write to create the proposal file(s). End by listing them." \
       "$prompt" >"$log" 2>&1 || true

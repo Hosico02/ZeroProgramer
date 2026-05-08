@@ -108,7 +108,9 @@ After Write succeeds, reply with one line: 'manifest written'. No further prose.
 
 echo "▸ profiling $WORKSPACE … (claude -p will Write the manifest)" >&2
 log=$(mktemp -t tm-profile.XXXXXX)
-TM_AUTO=1 claude -p \
+model_args=()
+[ -n "${TM_MODEL_CREATIVE:-}" ] && model_args=(--model "$TM_MODEL_CREATIVE")
+TM_AUTO=1 claude -p "${model_args[@]}" \
   --allowedTools "Read,Bash,Grep,Glob,Write" \
   --append-system-prompt "Be concise. Use tools. End by calling Write to $MANIFEST and replying 'manifest written'." \
   "$prompt" >"$log" 2>&1 || true

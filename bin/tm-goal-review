@@ -44,7 +44,9 @@ Reply with EXACTLY one JSON object on a single line, nothing else:
 Output now:"
 
 # Capture both streams; the regex parser below pulls JSON out regardless of mixed prose.
-raw=$(claude -p --allowedTools "Read,Bash,Grep,Glob" "$prompt" 2>&1 || true)
+model_args=()
+[ -n "${TM_MODEL_VERIFIER:-}" ] && model_args=(--model "$TM_MODEL_VERIFIER")
+raw=$(claude -p "${model_args[@]}" --allowedTools "Read,Bash,Grep,Glob" "$prompt" 2>&1 || true)
 
 python3 - <<PY
 import json, re, sys

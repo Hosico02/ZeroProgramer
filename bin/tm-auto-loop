@@ -107,7 +107,9 @@ Rules:
 - Don't ask the user any questions. Pick the most defensible interpretation.
 - You have Read, Write, Edit, Bash, Grep, Glob."
 
-  TM_AUTO=1 PATH="$ROOT/bin:$PATH" claude -p \
+  model_args=()
+  [ -n "${TM_MODEL_CREATIVE:-}" ] && model_args=(--model "$TM_MODEL_CREATIVE")
+  TM_AUTO=1 PATH="$ROOT/bin:$PATH" claude -p "${model_args[@]}" \
     --allowedTools "Read,Write,Edit,Bash,Grep,Glob" \
     --append-system-prompt "TM_AUTO mode: minimize prose. Use tools. Always end by calling tm-done." \
     "$prompt" >>"$LOG" 2>&1 || echo "(claude -p exited non-zero — see $LOG)" | tee -a "$LOG"
