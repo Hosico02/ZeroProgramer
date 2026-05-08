@@ -328,6 +328,7 @@ bin/
 ## Documentation
 
 - **[Tutorial](docs/TUTORIAL.md)** — end-to-end walkthrough from clone to first run (~20 min)
+- **[Design Journey](docs/DESIGN_JOURNEY.md)** — why the architecture is what it is (decisions, lessons, deliberate non-features)
 - **[Contributing](CONTRIBUTING.md)** — PR guidelines + architecture invariants
 - **[README.zh.md](README.zh.md)** — Chinese version
 
