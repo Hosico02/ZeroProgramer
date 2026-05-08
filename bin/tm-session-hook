@@ -63,6 +63,7 @@ YOUR JOB (think like a project manager)
         tm-risk-list                # tasks reclaimed/failing/stuck (worst first)
         tm-status-report            # writes status-reports/<iso>.md, your weekly snapshot
         tm-pm escalations           # any permanent failures
+        tm-vision list              # user's ambitions + agent proposals you should consider
         tail supervisor.log         # your prior decisions
         tm-context done             # what was actually delivered
 
@@ -93,6 +94,18 @@ YOUR JOB (think like a project manager)
       - same task reclaimed 3+ times → split it
       - 3+ consecutive clean-streaks with executors idle → broaden scope
       - escalation pattern across 2+ tasks → tighten or relax that axis
+      - vision.md item / proposals/ proposal is mature enough to graduate
+        into goal.md (move it from "could do" to "doing")
+
+  • **Promote a vision proposal**: \`tm-vision list\` shows any
+    proposals/ entries. If one looks ready, do:
+        tm-vision show <N>           # read full proposal
+    then either:
+      - Promote into goal.md via revise-goal (above), citing the proposal,
+        OR
+      - Reject by leaving a tm-decision note explaining why.
+    Don't let proposals sit forever — every cycle decide for each one:
+    promote, defer, or reject.
 
   • **Decisions log (audit trail)**: any non-trivial choice — picking which
     workspace file to promote, declining to revise goal despite signals,
@@ -145,7 +158,14 @@ the project clean only after a thorough multi-dimensional sweep.
 LOOP
 
 1. Inspect the project to decide whether one new task is worth proposing:
-   - Read goal.md (project intent).
+   - Read goal.md (current scope).
+   - Read vision.md if present (user's longer-term ambitions, plus
+     proposals from \`tm-vision propose\`). Items in vision.md are
+     legitimate task sources too — you can propose work towards a
+     vision item, just label it clearly in the title (e.g.
+     "[vision] add auth scaffolding for multi-tenant"). Don't push
+     vision items as aggressively as goal.md axes; vision is direction,
+     goal is commitment.
    - **Read manifest.json** (project-DERIVED dimensions). This file is
      produced by tm-profile and contains 3-7 dimensions tailored to THIS
      specific codebase — not a generic checklist. Each has a signal_cmd

@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# tm-vision — innovation channel for the project.
+#
+# Two input sources for "where this project could go":
+#
+#   1. vision.md (USER-AUTHORED, primary)
+#      You write your ambitions here directly. Planner & supervisor read
+#      it every cycle alongside goal.md. This is THE channel for human
+#      creativity — the agents can't out-imagine you on what your project
+#      should become.
+#
+#   2. proposals/<iso>-<slug>.md (AGENT-GENERATED, supplementary)
+#      tm-vision propose runs claude -p with a creative prompt asking for
+#      one ambitious direction. Output lands in proposals/. The supervisor
+#      reviews and decides whether to promote into goal.md.
+#
+# Usage:
+#   tm-vision add "<one-line idea>"          # append to vision.md
+#   tm-vision propose [N]                    # agent generates N ambitious proposals
+#   tm-vision list                           # show vision.md + recent proposals
+#   tm-vision show <N>                       # display proposal #N
+#   tm-vision clear-proposals                # delete all generated proposals
+#   tm-vision edit                           # open vision.md in $EDITOR
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VISION="$ROOT/vision.md"
+PROP_DIR="$ROOT/proposals"
+WORKSPACE="$ROOT/workspace"
+
+slugify() {
+  python3 -c "
+import sys, re
+s = sys.argv[1].lower()
+s = re.sub(r'[^a-z0-9]+', '-', s)
+s = re.sub(r'^-+|-+\$', '', s)
+print(s[:50] or 'untitled')
+" "$1"
+}
+
+ensure_vision() {
+  if [ ! -f "$VISION" ]; then
+    cat > "$VISION" <<'EOF'
+# Project vision — long-term ambitions
+
+This file is for ambitions that DON'T have to be done right now but
+should shape where the project goes. Different from `goal.md`:
+
+- `goal.md` = "what 'done' looks like for the current iteration"
+- `vision.md` = "what this project could become 6-24 months from now"
+
+Planner reads both and proposes work towards either. Supervisor can
+promote items from vision into goal.md when the project is ready.
+
+## User-authored vision
+
+(Add bullet points here — directions, capabilities, audiences, surfaces
+the project could grow into. Be ambitious; this is your innovation
+channel, not a backlog.)
+
+-
+
+## Agent-generated proposals
+
+See proposals/ directory; supervisor reviews and promotes selected
+items here when ready.
+EOF
+    echo "▸ created vision.md template" >&2
+  fi
+}
+
+case "${1:-}" in
+  add)
+    text="${2:-}"
+    [ -z "$text" ] && { echo "tm-vision add: missing text" >&2; exit 1; }
+    ensure_vision
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # Insert under "## User-authored vision"
+    python3 - "$VISION" "$text" "$ts" <<'PY'
+import sys, re
+path, text, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(path).read()
+marker = "## User-authored vision"
+if marker not in src:
+    src = src.rstrip() + f"\n\n{marker}\n\n"
+# Find first - bullet placeholder ('- ' on its own line) and replace; else append after marker
+lines = src.split("\n")
+out = []
+inserted = False
+in_user_section = False
+for i, ln in enumerate(lines):
+    if ln.strip() == marker.strip():
+        in_user_section = True
+        out.append(ln)
+        continue
+    if in_user_section and ln.startswith("## "):
+        # leaving section; insert before
+        if not inserted:
+            out.append(f"- {text}  *(added {ts})*")
+            inserted = True
+        in_user_section = False
+        out.append(ln)
+        continue
+    if in_user_section and ln.strip() == "-" and not inserted:
+        out.append(f"- {text}  *(added {ts})*")
+        inserted = True
+        continue
+    out.append(ln)
+if not inserted:
+    out.append(f"- {text}  *(added {ts})*")
+open(path, "w").write("\n".join(out))
+print(f"✓ appended to vision.md: {text}")
+PY
+    ;;
+
+  propose)
+    n="${2:-1}"
+    if ! command -v claude >/dev/null; then
+      echo "tm-vision propose: claude CLI not found" >&2
+      exit 2
+    fi
+    ensure_vision
+    mkdir -p "$PROP_DIR"
+    GOAL_TXT=""
+    [ -f "$ROOT/goal.md" ] && GOAL_TXT=$(cat "$ROOT/goal.md")
+    VISION_TXT=$(cat "$VISION")
+    # Recent done summaries (so the agent sees what's been incremental gap-fill)
+    RECENT=$(python3 - "$ROOT/pm-state.json" 2>/dev/null <<'PY' || echo "(no recent tasks)"
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    print("(no recent tasks)"); sys.exit(0)
+done = [t for t in s.get("tasks", []) if t["status"] == "done"][-6:]
+if not done:
+    print("(no done tasks)"); sys.exit(0)
+for t in done:
+    title = (t.get("title") or "")[:120]
+    print(f"  - #{t['id']} {title}")
+PY
+)
+    prompt="You are an innovation strategist for a software project. Your job is NOT to fix bugs or fill gaps. Your job is to propose ${n} genuinely AMBITIOUS direction(s) this project could grow into — directions not currently in goal.md or vision.md but that would meaningfully expand what the project IS or who it serves.
+
+WORKSPACE: $WORKSPACE
+
+GOAL.MD (current scope):
+---
+$GOAL_TXT
+---
+
+VISION.MD (user's existing ambitions — DON'T duplicate these):
+---
+$VISION_TXT
+---
+
+RECENT DONE TASKS (to see what's been incremental gap-fill, NOT what to imitate):
+$RECENT
+
+EXAMPLES OF AMBITIOUS (worth proposing):
+- New product surface: CLI tool → web UI; backend → public REST/GraphQL API
+- New user persona: devops users → data scientists; single-user → multi-tenant
+- Different platform: CLI → VS Code extension; SaaS → self-hosted Docker
+- Genuinely new capability: read-only → edit; sync → realtime; single-purpose → composable plugin system
+- Scale-up: one-project → manage N projects; one-team → cross-org
+
+NOT AMBITIOUS (DO NOT propose — these are gap-fill):
+- 'Add timeout to X', 'increase test coverage of Y', 'refactor Z', 'document feature W'
+- Anything that's already implied by an existing goal.md axis
+
+For EACH proposal, use the Write tool to write a file at:
+  $PROP_DIR/<iso>-<slug>.md
+
+with this body:
+
+# <one-line title>
+
+- **status:** proposed
+- **proposed_at:** <ISO-8601 UTC>
+
+## Why this is ambitious
+- <bullet>
+- <bullet>
+
+## What would change
+- <bullet>
+- <bullet>
+
+## First three concrete steps
+1. <step>
+2. <step>
+3. <step>
+
+## Risk / effort
+- <bullet>
+- <bullet>
+
+After Writing all ${n} files, reply with one line per file: '✓ proposed: <filename>'. No further prose.
+
+Begin."
+
+    echo "▸ tm-vision propose: asking claude for $n ambitious proposal(s)..." >&2
+    log=$(mktemp -t tm-vision.XXXXXX)
+    TM_AUTO=1 claude -p \
+      --allowedTools "Read,Bash,Grep,Glob,Write" \
+      --append-system-prompt "Be concise. Use Write to create the proposal file(s). End by listing them." \
+      "$prompt" >"$log" 2>&1 || true
+
+    new_files=$(find "$PROP_DIR" -maxdepth 1 -name '*.md' -newer "$log" 2>/dev/null)
+    if [ -z "$new_files" ]; then
+      echo "tm-vision propose: no proposal file(s) written. claude log tail:" >&2
+      tail -20 "$log" >&2
+      rm -f "$log"
+      exit 4
+    fi
+    echo "$new_files" | while read -r f; do
+      echo "  ✓ $f"
+    done
+    rm -f "$log"
+    ;;
+
+  list)
+    echo "── vision.md ──"
+    if [ -f "$VISION" ]; then
+      sed -n '/## User-authored vision/,/## Agent-generated proposals/p' "$VISION" | sed '$d'
+    else
+      echo "(no vision.md yet — try: tm-vision add \"<idea>\")"
+    fi
+    echo
+    echo "── proposals/ (agent-generated) ──"
+    if [ ! -d "$PROP_DIR" ] || [ -z "$(ls -A "$PROP_DIR" 2>/dev/null)" ]; then
+      echo "(none yet — try: tm-vision propose 2)"
+    else
+      i=0
+      for f in $(ls -t "$PROP_DIR"/*.md 2>/dev/null); do
+        i=$((i + 1))
+        title=$(sed -n '1s/^# //p' "$f" | head -1)
+        printf '  %d. %-60s  %s\n' "$i" "${title:-(untitled)}" "$(basename "$f")"
+      done
+    fi
+    ;;
+
+  show)
+    n="${2:-1}"
+    if [ ! -d "$PROP_DIR" ]; then
+      echo "tm-vision show: no proposals/ yet" >&2; exit 1
+    fi
+    f=$(ls -t "$PROP_DIR"/*.md 2>/dev/null | sed -n "${n}p")
+    [ -z "$f" ] && { echo "tm-vision show: proposal $n not found" >&2; exit 1; }
+    cat "$f"
+    ;;
+
+  clear-proposals)
+    rm -rf "$PROP_DIR"
+    echo "✓ cleared proposals/"
+    ;;
+
+  edit)
+    ensure_vision
+    "${EDITOR:-vi}" "$VISION"
+    ;;
+
+  -h|--help|"")
+    sed -n '2,21p' "$0" | sed 's/^# \?//'
+    ;;
+
+  *)
+    echo "tm-vision: unknown subcommand '$1'" >&2
+    echo "Usage: tm-vision {add|propose|list|show|clear-proposals|edit}" >&2
+    exit 1
+    ;;
+esac

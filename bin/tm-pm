@@ -131,7 +131,8 @@ PY
     "$ROOT/bin/tm-planner" stop >/dev/null 2>&1 || true
     rm -rf "$ROOT/events" "$ROOT/tasks" "$ROOT/nags" "$ROOT/escalations"
     rm -rf "$ROOT/goal-history" "$ROOT/bin/.promoted-bak"
-    rm -rf "$ROOT/status-reports" "$ROOT/decisions"
+    rm -rf "$ROOT/status-reports" "$ROOT/decisions" "$ROOT/proposals"
+    # NOTE: vision.md is user-authored (like goal.md) — not wiped by reset
     rm -f  "$ROOT/pm-state.json" "$ROOT/pm.log" "$ROOT/.session-id"
     rm -f  "$ROOT/planner.log" "$ROOT/planner.pid" "$ROOT/supervisor.log"
     mkdir -p "$ROOT/events" "$ROOT/tasks" "$ROOT/nags"

@@ -40,6 +40,20 @@
 | L4 | Agent 改自己源码 | executor 在 workspace/ 编辑产品代码 |
 | L5 | 改动自动同步到 production | `tm-promote` 带 stale-snapshot 检测 |
 | L6 | Goal 自动演进 | `tm-supervise revise-goal` + version snapshot |
+| 创新通道 | 人/LLM 双源注入野心 | `vision.md`（你写）+ `tm-vision propose`（LLM brainstorm）→ supervisor 决定何时 promote |
+
+## 创新性的限制（坦诚说）
+
+这套系统**擅长 gap-filling，不擅长 invention**：planner 看 manifest 找漏洞、补测试、硬化代码。但它**不能**自己想到「这项目其实可以变成 SaaS / 加 web UI / 跨项目编排」这种跳脱当前 scope 的方向。
+
+解决方案是 **人是创新源头**，加了两个通道把创新接入系统：
+
+| 通道 | 谁产生 | 写到哪 | 谁消费 |
+|---|---|---|---|
+| `vision.md` | **你（人类）** 直接写 | repo 根目录 | planner 每轮读，supervisor 也读 |
+| `proposals/` | LLM brainstorm 产生（`tm-vision propose`） | `proposals/<iso>-<slug>.md` | supervisor 决定 promote / defer / reject |
+
+vision 项**不**直接进任务队列。supervisor 看到合适的会通过 `tm-supervise revise-goal` 把它 promote 到 goal.md，然后 planner 自然会派任务实现它。这层 gating 防止 LLM 头脑发热的「点子」直接污染项目方向。
 
 PM 角色：
 - **PM (Python daemon)** — 派活、跟踪、GC、escalation 升级。零 token。
@@ -151,16 +165,48 @@ cp -r ~/old-source/* workspace/   # 把要被管理的代码放进 workspace/
 ./bin/tm-goal-snapshot diff 1                      # 当前 vs 上一版
 ```
 
+### 你自己加创新点（在终端里）
+
+任何时候，你都可以直接给系统注入一个野心方向：
+
+```bash
+# 一行命令加一条想法到 vision.md
+./bin/tm-vision add "Web UI dashboard with real-time agent activity stream"
+
+# 或者用编辑器自由发挥
+./bin/tm-vision edit               # 等于 $EDITOR vision.md
+
+# 看现在 vision.md 里有什么 + 已有哪些 LLM 提案
+./bin/tm-vision list
+
+# 让 LLM 帮你 brainstorm 2 个野心方向（写到 proposals/）
+./bin/tm-vision propose 2
+
+# 看具体某个 proposal
+./bin/tm-vision show 1
+
+# 清空所有 LLM proposal（vision.md 不动）
+./bin/tm-vision clear-proposals
+```
+
+加进去之后**不需要重启**任何东西。下个 cycle planner 和 supervisor 都会读到。supervisor 的工作流里包含「看 vision/proposals → 决定 promote 或 defer」。
+
+`vision.md` 是 **user-authored**（像 goal.md 一样不被 reset 清掉）。`proposals/` 是 **agent-generated**，会被 reset 清。
+
 ---
 
 ## 项目产物（每次跑都会留下，可审计）
 
 ```
 project/
+├── goal.md                  # 当前迭代的 done 标准（你写）
+├── vision.md                # 长期野心方向（你写，创新源头）
 ├── status-reports/          # supervisor 周报系列
 │   └── 2026-05-08T10-30Z.md
 ├── decisions/               # ADR 决策日志
 │   └── 001-skip-promoting-tm-statusline.md
+├── proposals/               # LLM brainstorm 出的野心提案（待 supervisor 评估）
+│   └── 2026-05-08T11-15Z-web-dashboard.md
 ├── goal-history/            # goal.md 每次演进的快照
 ├── escalations/             # 永久 fail 的任务（理想为空）
 ├── workspace/               # executor 真实编辑的代码
@@ -249,6 +295,7 @@ bin/
 ├── tm-plan-cycle             # planner 的 CLI (add/clean)
 ├── tm-done                   # executor 的 CLI
 ├── tm-context                # 任务/历史查询
+├── tm-vision                 # 创新通道：add / propose / list / show / edit
 ├── tm-title-keeper           # 标题栏实时刷新
 ├── tm-status-title           # 标题栏文本生成
 ├── tm-statusline             # Claude Code statusLine 命令
