@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-ROOT             = Path(__file__).resolve().parent.parent
+ROOT             = Path(os.environ["TM_ROOT"]).resolve() if os.environ.get("TM_ROOT") else Path(__file__).resolve().parent.parent
 EVENTS_DIR       = ROOT / "events"
 EVENTS_PROCESSED = ROOT / "events" / ".processed"
 TASKS_DIR        = ROOT / "tasks"
