@@ -5,27 +5,29 @@
 A **multi-agent self-managing project** framework. Install once, and a team of Claude agents takes over your project: planning, coding, reviewing, and adjusting course autonomously — until convergence or token exhaustion.
 
 ```
-                 ┌──────────────────────────────────┐
-                 │  SUPERVISOR (Claude, "the brain")│  L3-L6 meta-decisions
-                 │  - patrol / write reports /       │
-                 │    decide escalation paths        │
-                 │  - edit goal.md / promote workspace│
-                 │  - decide when to shutdown        │
-                 └──────────────┬───────────────────┘
-                                │ note / shutdown
-                                ▼
-   ┌────────────────┐   ┌──────────────────────┐   ┌────────────────────┐
-   │  PLANNER       │──▶│   pm-daemon.py        │──▶│  EXECUTOR × N      │
-   │  Claude (ideas) │   │   Python (dispatcher) │   │  Claude (work)     │
-   │  add_task      │   │   ✓ deterministic     │   │  edits workspace/  │
-   │  ⨯ no code     │   │   ✓ zero-token        │   │  tm-done reports   │
-   │                │   │   ✓ FOREVER mode      │   │                    │
-   └────────────────┘   └──────────────────────┘   └────────────────────┘
-                                ▲
-                                │ events/*.json (file mailbox)
-                                │
-                         all four decoupled
+                 ┌─────────────────────────────────────────┐
+                 │  SUPERVISOR (Claude, "the brain")        │  L3-L6 meta-decisions
+                 │  - patrol / write reports                │  + planning duties
+                 │  - decide escalation paths               │  (calls tm-plan-cycle
+                 │  - edit goal.md / promote workspace      │   directly when queue
+                 │  - decide when to shutdown               │   runs low)
+                 └────────────────────┬────────────────────┘
+                                      │ note / add_task / shutdown
+                                      ▼
+                          ┌──────────────────────┐         ┌────────────────────┐
+                          │   pm-daemon.py        │────────▶│  EXECUTOR × N      │
+                          │   Python (dispatcher) │         │  Claude (work)     │
+                          │   ✓ deterministic     │         │  edits workspace/  │
+                          │   ✓ zero-token        │         │  tm-done reports   │
+                          │   ✓ FOREVER mode      │         │                    │
+                          └──────────────────────┘         └────────────────────┘
+                                      ▲
+                                      │ events/*.json (file mailbox)
+                                      │
+                              all roles decoupled
 ```
+
+**Default is 3-agent** (supervisor + N executors). Pass `--with-planner` to spawn a separate `PLANNER` Claude session — useful when the supervisor's combined load gets too dense, or you want planner / supervisor decisions independently auditable.
 
 **Core idea**: use LLMs where they earn their keep (creativity, judgment, code authoring); leave the dispatch plumbing to deterministic Python (assigning tasks, tracking state, nagging, recycling crashed workers).
 
@@ -50,21 +52,21 @@ Built-in maturity ladder, all levels in place (L0–L6):
 
 ## On creativity (honest disclosure)
 
-This system is **good at gap-filling, not invention**: the planner reads `manifest.json`, finds undone work, hardens code, fills coverage gaps. It **cannot** dream up "this should become a SaaS" / "this needs a web UI" / "this should run cross-project" — those are leaps outside the closed loop.
+This system is **good at gap-filling, not invention**: the planning loop reads `manifest.json`, finds undone work, hardens code, fills coverage gaps. It **cannot** dream up "this should become a SaaS" / "this needs a web UI" / "this should run cross-project" — those are leaps outside the closed loop.
 
 The fix: **humans are the source of innovation**. Two channels feed novel directions into the system:
 
 | Channel | Source | Stored at | Read by |
 |---|---|---|---|
-| `vision.md` | **You (human)** write directly | repo root | planner each cycle, supervisor each cycle |
+| `vision.md` | **You (human)** write directly | repo root | supervisor each cycle (and planner each cycle if `--with-planner`) |
 | `proposals/` | LLM brainstorm via `tm-vision propose` | `proposals/<iso>-<slug>.md` | supervisor decides promote / defer / reject |
 
-Vision items do **not** enter the task queue directly. The supervisor is a gating layer — when something looks ripe, it's promoted into `goal.md` via `tm-supervise revise-goal`, after which the planner naturally generates tasks toward it. This gating prevents LLM-generated "ideas" from hijacking the project's direction.
+Vision items do **not** enter the task queue directly. The supervisor is a gating layer — when something looks ripe, it's promoted into `goal.md` via `tm-supervise revise-goal`, after which the planning loop naturally generates tasks toward it. This gating prevents LLM-generated "ideas" from hijacking the project's direction.
 
 Roles in detail:
 - **PM (Python daemon)** — dispatches, tracks, GCs, escalates. Zero token cost.
-- **SUPERVISOR (Claude)** — project manager: status reports, decisions, course corrections, shutdown.
-- **PLANNER (Claude)** — keeps work flowing. Dimensions are **derived from the project itself**: `tm-profile` reads workspace/ and writes `manifest.json` with 3-7 dimensions tailored to THIS code (candidate pool covers correctness/robustness/perf/security/features/UI/docs/distribution/integrations/data_model, plus domain-specific axes like frame_pacing for games, audio_latency for audio apps, numerical_stability for physics sims). **Dimensions that don't apply to this project don't enter the manifest, saving tokens on irrelevant audits**. Planner only reads the manifest.
+- **SUPERVISOR (Claude)** — project manager: status reports, decisions, course corrections, shutdown. **In default 3-agent mode, also handles planning** — calls `tm-plan-cycle add` directly when the queue runs low. Planning dimensions are **derived from the project itself**: `tm-profile` reads workspace/ and writes `manifest.json` with 3-7 dimensions tailored to THIS code (candidate pool covers correctness/robustness/perf/security/features/UI/docs/distribution/integrations/data_model, plus domain-specific axes like frame_pacing for games, audio_latency for audio apps, numerical_stability for physics sims). **Dimensions that don't apply to this project don't enter the manifest, saving tokens on irrelevant audits**.
+- **PLANNER (Claude, opt-in)** — separate planner session, enabled with `tm-team-up --with-planner`. Identical responsibilities to the supervisor's planning role; use when supervisor's combined load is too dense, or when you want planner / supervisor decisions independently auditable. The 4-agent (supervisor + planner + executors) was the original design; 3-agent is the default after measuring lower steady-state token cost.
 - **EXECUTOR × N (Claude)** — the hands. Edits code in workspace/. Multiple executors run in parallel.
 
 ---
@@ -78,11 +80,13 @@ The bundled demo points workspace/ at a copy of the framework itself, so the age
 ```bash
 cd ZeroProgramer
 ./bin/setup-self-optimize       # copies framework into workspace/
-./bin/tm-team-up 2              # opens 4 Terminal windows: 1 supervisor + 1 planner + 2 executors
-./bin/tm-pm watch               # in another terminal: real-time dashboard
+./bin/tm-team-up 2              # 1 supervisor + 2 executors, headless; tm-web auto-opens in browser
+./bin/tm-web                    # (already auto-opened, but you can re-open any time)
 ```
 
-Each new window auto-submits `go` and the agent enters its role-specific loop **without manual input**.
+Default mode is **headless agents + browser dashboard** — no terminal windows pop open. Pass `--windows` for legacy per-agent terminal windows, `--native` for the experimental tkinter window, or `--with-planner` to spawn a 4-agent team.
+
+Each agent auto-submits `go` and enters its role-specific loop **without manual input**.
 
 ### Option B: Install on your own project (recommended)
 
@@ -163,7 +167,7 @@ project-name · `done/total` · `▶in_progress` · `busy/total workers` · role
 
 ```bash
 ./bin/tm-claude-supervisor        # the brain (meta-decisions)
-./bin/tm-claude-planner           # ideas (continuous task generation)
+./bin/tm-claude-planner           # opt-in: separate planner Claude session (4-agent mode); skip in default 3-agent
 ./bin/tm-claude-executor          # work (edits workspace/)
 ```
 
@@ -205,7 +209,7 @@ You can drop ambitious directions into the system at any moment:
 ./bin/tm-vision clear-proposals
 ```
 
-**No restart needed**. The next planner/supervisor cycle reads them. The supervisor's workflow includes "review vision/proposals → decide promote / defer".
+**No restart needed**. The next supervisor cycle (and planner cycle if `--with-planner`) reads them. The supervisor's workflow includes "review vision/proposals → decide promote / defer".
 
 `vision.md` is **user-authored** (like goal.md, not wiped by reset). `proposals/` is **agent-generated** and is wiped by reset.
 
@@ -241,16 +245,16 @@ Anyone can later read `status-reports` for progress, `decisions` for "why did it
 
 ## Token economics
 
-| Process | Job | Token cost |
-|---|---|---|
-| `pm-daemon.py` | State machine dispatching | **0** |
-| `tm-title-keeper` (×N) | Window title refresh | **0** |
-| `tm-pm watch` / `tail` / `status-report` etc. | Read-only monitoring | **0** |
-| supervisor (Claude) | Patrol + decisions | ~5% |
-| planner (Claude) | Cross-dimension search | ~25% |
-| executor × N (Claude) | Actually editing code | ~70% |
+| Process | Job | Token cost (3-agent default) | Token cost (4-agent `--with-planner`) |
+|---|---|---|---|
+| `pm-daemon.py` | State machine dispatching | **0** | **0** |
+| `tm-title-keeper` (×N) | Window title refresh | **0** | **0** |
+| `tm-pm watch` / `tm-web` / `tail` etc. | Read-only monitoring | **0** | **0** |
+| supervisor (Claude) | Patrol + decisions + planning | ~25% | ~5% |
+| planner (Claude) | Cross-dimension search | (folded into supervisor) | ~25% |
+| executor × N (Claude) | Actually editing code | ~75% | ~70% |
 
-**~99% of LLM budget goes to executors writing code** — by design.
+**~75–99% of LLM budget goes to executors writing code** — by design. 3-agent default saves a separate planner context (~25% lower steady-state cost) at the price of a denser supervisor; 4-agent splits load when supervisor saturates.
 
 When tokens run out: planner / executor calls fail → escalations → supervisor sees the pattern → calls `tm-supervise shutdown` → PM exits gracefully. **The system decides for itself when to stop.**
 
@@ -432,9 +436,9 @@ bin/
 ├── tm-team-up                # one-shot full-team launch
 ├── tm-init                   # install framework into target dir
 ├── tm-claude-supervisor      # spawn supervisor window
-├── tm-claude-planner         # spawn planner window
+├── tm-claude-planner         # spawn planner window (opt-in, 4-agent mode only)
 ├── tm-claude-executor        # spawn executor window
-├── tm-launch-helpers         # spawn planner + N executors (no supervisor)
+├── tm-launch-helpers         # spawn planner + N executors (no supervisor) — legacy helper
 ├── tm-status-report          # markdown weekly report
 ├── tm-decision               # ADR decision log
 ├── tm-risk-list              # risk register

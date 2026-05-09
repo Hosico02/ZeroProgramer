@@ -1,9 +1,4 @@
 {
-  "statusLine": {
-    "type": "command",
-    "command": "$CLAUDE_PROJECT_DIR/bin/tm-statusline",
-    "padding": 0
-  },
   "permissions": {
     "allow": [
       "Bash(./bin/tm-pm:*)",
@@ -48,7 +43,10 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/tm-session-hook" }
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/bin/tm-session-hook"
+          }
         ]
       }
     ],
@@ -56,7 +54,10 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/tm-prompt-hook" }
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/bin/tm-prompt-hook"
+          }
         ]
       }
     ],
@@ -64,7 +65,10 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/tm-stop-hook" }
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/bin/tm-stop-hook"
+          }
         ]
       }
     ],
@@ -72,7 +76,10 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/bin/tm-tool-hook" }
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/bin/tm-tool-hook"
+          }
         ]
       }
     ]
