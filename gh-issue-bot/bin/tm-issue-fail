@@ -15,7 +15,28 @@ REASON="$*"
 [ -n "${TM_GH_REPO:-}" ]         || { echo "TM_GH_REPO unset" >&2; exit 2; }
 LABEL="${TM_ISSUE_FAIL_LABEL:-auto-fix-failed}"
 
-BODY="$(printf 'auto-fix-failed: %s\n\n(gh-issue-bot will not retry this issue until the `%s` label is removed.)\n' "$REASON" "$LABEL")"
+BODY="$(cat <<EOF
+**🤖 gh-issue-bot 尝试自动解决此 issue 失败。**
+
+### 失败原因
+
+${REASON}
+
+### bot 都做了什么
+
+- 在 worktree \`worktrees/issue-${ISSUE}/\` 内启动了一个隔离的 Claude session
+- 让它读 issue 的 title + body 后在 worktree 里编辑代码
+- 该 session 未能产出可推送的修复（详见上面的失败原因）
+
+### 接下来你可以
+
+1. **改进 issue body** 让 bot 下次能理解：明确指出文件路径、需要的修改、验收方式
+2. **手动撤掉 \`${LABEL}\` 标签** —— 撤掉后 bot 下次 tick 会重试
+3. **手动关掉这个 issue** —— 如果你认为不该自动修
+
+> bot 不会自动重试带 \`${LABEL}\` 标签的 issue，避免反复烧 token。
+EOF
+)"
 
 gh issue comment "$ISSUE" --repo "$TM_GH_REPO" --body "$BODY" >/dev/null
 gh issue edit    "$ISSUE" --repo "$TM_GH_REPO" --add-label "$LABEL" >/dev/null
