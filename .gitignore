@@ -53,3 +53,7 @@ __pycache__/
 *.swp
 .idea/
 .vscode/
+
+# ── application runtime logs ──
+resolve-*.log
+watcher.log
