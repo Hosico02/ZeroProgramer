@@ -17,13 +17,14 @@ def _git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
-def _make_worktree_with_diff(tmp_git_repo, bot_root, issue_num):
-    """Create a worktree at bot_root/worktrees/issue-N with a real diff."""
-    branch = f"auto-fix/issue-{issue_num}"
-    wt = bot_root / "worktrees" / f"issue-{issue_num}"
+def _make_worktree_with_diff(tmp_git_repo, bot_root, issue_num, branch="auto-fix"):
+    """Create the unified worktree at bot_root/worktrees/<branch> with a diff."""
+    wt = bot_root / "worktrees" / branch
     wt.parent.mkdir(parents=True, exist_ok=True)
-    _git("worktree", "add", "-b", branch, str(wt), "main", cwd=tmp_git_repo)
-    (wt / "fix.txt").write_text("the fix\n")
+    if not wt.exists():
+        _git("worktree", "add", "-b", branch, str(wt), "main", cwd=tmp_git_repo)
+    fix_path = wt / f"fix-{issue_num}.txt"
+    fix_path.write_text(f"the fix for #{issue_num}\n")
     _git("add", "-A", cwd=wt)
     _git("commit", "-m", f"fix #{issue_num}", cwd=wt)
     return wt, branch
@@ -66,7 +67,7 @@ def test_finalize_happy_path_pushes_pr_and_comments(tmp_git_repo, tmp_bot_root, 
     env["PATH"] = f"{stubs}:{env['PATH']}"
     env["TM_GH_REPO"] = "o/r"
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
-    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
+    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix"
 
     proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
                           capture_output=True, text=True)
@@ -93,7 +94,7 @@ def test_finalize_pr_body_includes_closes_diffstat_commit(
     env["PATH"] = f"{stubs}:{env['PATH']}"
     env["TM_GH_REPO"] = "owner/repo"
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
-    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
+    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix"
 
     proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
                           capture_output=True, text=True)
@@ -103,13 +104,14 @@ def test_finalize_pr_body_includes_closes_diffstat_commit(
     log_text = gh_log.read_text()
     bodies = [seg.split("BODY_END", 1)[0] for seg in log_text.split("BODY_BEGIN")[1:]]
     assert any(f"Closes #{issue}" in b for b in bodies)
-    assert any("fix.txt" in b for b in bodies)  # diff stat file
+    assert any(f"fix-{issue}.txt" in b for b in bodies)  # diff stat file
 
 
 def test_finalize_rejects_outside_worktree(tmp_path, monkeypatch):
     """Running finalize from a path outside the bot's worktrees/ must fail."""
     env = os.environ.copy()
     env["TM_BOT_ROOT"] = str(tmp_path / "elsewhere")
+    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix"
     proc = subprocess.run(
         [str(FINALIZE), "1"], cwd=tmp_path, env=env, capture_output=True, text=True,
     )
@@ -120,14 +122,14 @@ def test_finalize_rejects_outside_worktree(tmp_path, monkeypatch):
 def test_finalize_rejects_wrong_branch(tmp_git_repo, tmp_bot_root, tmp_path):
     """Branch must start with TM_ISSUE_BRANCH_PREFIX."""
     issue = 2
-    wt = tmp_bot_root / "worktrees" / f"issue-{issue}"
+    wt = tmp_bot_root / "worktrees" / "auto-fix"
     wt.parent.mkdir(parents=True, exist_ok=True)
     _git("worktree", "add", "-b", "feature/wrong", str(wt), "main", cwd=tmp_git_repo)
     (wt / "fix.txt").write_text("x"); _git("add", "-A", cwd=wt); _git("commit", "-m", "x", cwd=wt)
 
     env = os.environ.copy()
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
-    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
+    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix"
 
     proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
                           capture_output=True, text=True)
@@ -137,15 +139,15 @@ def test_finalize_rejects_wrong_branch(tmp_git_repo, tmp_bot_root, tmp_path):
 
 def test_finalize_empty_diff_fails(tmp_git_repo, tmp_bot_root, tmp_path):
     issue = 3
-    wt = tmp_bot_root / "worktrees" / f"issue-{issue}"
+    wt = tmp_bot_root / "worktrees" / "auto-fix"
     wt.parent.mkdir(parents=True, exist_ok=True)
-    branch = f"auto-fix/issue-{issue}"
+    branch = "auto-fix"
     _git("worktree", "add", "-b", branch, str(wt), "main", cwd=tmp_git_repo)
     # No diff.
 
     env = os.environ.copy()
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
-    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
+    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix"
     env["TM_GH_REPO"] = "o/r"
 
     proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
@@ -167,7 +169,7 @@ def test_finalize_idempotent_when_pr_exists(tmp_git_repo, tmp_bot_root, tmp_path
     env["PATH"] = f"{stubs}:{env['PATH']}"
     env["TM_GH_REPO"] = "o/r"
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
-    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
+    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix"
 
     proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
                           capture_output=True, text=True)
@@ -180,9 +182,9 @@ def test_finalize_idempotent_when_pr_exists(tmp_git_repo, tmp_bot_root, tmp_path
 
 def test_finalize_diff_too_large(tmp_git_repo, tmp_bot_root, tmp_path):
     issue = 5
-    wt = tmp_bot_root / "worktrees" / f"issue-{issue}"
+    wt = tmp_bot_root / "worktrees" / "auto-fix"
     wt.parent.mkdir(parents=True, exist_ok=True)
-    branch = f"auto-fix/issue-{issue}"
+    branch = "auto-fix"
     _git("worktree", "add", "-b", branch, str(wt), "main", cwd=tmp_git_repo)
     big = "\n".join(f"line {i}" for i in range(1500)) + "\n"
     (wt / "big.txt").write_text(big)
@@ -190,7 +192,7 @@ def test_finalize_diff_too_large(tmp_git_repo, tmp_bot_root, tmp_path):
 
     env = os.environ.copy()
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
-    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
+    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix"
     env["TM_ISSUE_MAX_DIFF_LINES"] = "100"
     env["TM_GH_REPO"] = "o/r"
 

@@ -34,10 +34,25 @@ if [ -z "${TM_GH_REPO:-}" ]; then
   export TM_GH_REPO
 fi
 [ -n "${TM_GH_REPO:-}" ] || { echo "TM_GH_REPO unset and could not derive from git remote origin" >&2; exit 2; }
-[ -n "${TM_ISSUE_BRANCH_PREFIX:-}" ] || TM_ISSUE_BRANCH_PREFIX="auto-fix/issue-"
+[ -n "${TM_ISSUE_BRANCH_PREFIX:-}" ] || TM_ISSUE_BRANCH_PREFIX="auto-fix"
 
-WT="$TM_BOT_ROOT/worktrees/issue-$ISSUE"
-[ -d "$WT" ] || { echo "no worktree: $WT" >&2; exit 1; }
+# Unified-branch model: literal branch name, single shared worktree dir.
+BRANCH="$TM_ISSUE_BRANCH_PREFIX"
+WT="$TM_BOT_ROOT/worktrees/$BRANCH"
+
+# Auto-create the worktree if missing (e.g., manual invocation, or first run).
+if [ ! -d "$WT" ]; then
+  PARENT_REPO="$(cd "$TM_BOT_ROOT/.." && pwd)"
+  mkdir -p "$TM_BOT_ROOT/worktrees"
+  # Try to base the worktree on existing remote branch first, else main.
+  git -C "$PARENT_REPO" fetch origin "$BRANCH" 2>/dev/null || true
+  if git -C "$PARENT_REPO" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    git -C "$PARENT_REPO" worktree add -B "$BRANCH" "$WT" "origin/$BRANCH" >/dev/null
+  else
+    git -C "$PARENT_REPO" fetch origin main 2>/dev/null || true
+    git -C "$PARENT_REPO" worktree add -B "$BRANCH" "$WT" "origin/main" >/dev/null
+  fi
+fi
 
 MODEL="${TM_FIXER_MODEL:-claude-haiku-4-5}"
 MAX_USD="${TM_FIXER_MAX_USD:-0.10}"
@@ -79,16 +94,20 @@ Resolve this issue with the minimum edit. Stop as soon as the file is saved.
 EOF
 )"
 
-# 2. Sync worktree to current origin/main as branch base. Without this,
-# if local main moved between worktree creation and resolve time, the PR's
-# diff will include inverse-of-those-commits as if the branch is reverting
-# them. Reset on first run is fine; on a re-run for the same issue we just
-# overwrite the prior local attempt (the prior commit on the branch is
-# discarded — the resolver always produces a single, current-base commit).
+# 2. Sync worktree branch to current origin state. In unified-branch mode
+# we want to preserve prior fixes accumulated on origin/$BRANCH, so we try
+# that first. If the remote branch doesn't exist yet (first ever fix),
+# fall back to origin/main.
 cd "$WT"
+git fetch origin "$BRANCH" >/dev/null 2>&1 || true
 git fetch origin main >/dev/null 2>&1 || true
-if git rev-parse --verify origin/main >/dev/null 2>&1; then
-  git checkout -B "${TM_ISSUE_BRANCH_PREFIX}${ISSUE}" origin/main >/dev/null 2>&1 || {
+if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+  git checkout -B "$BRANCH" "origin/$BRANCH" >/dev/null 2>&1 || {
+    echo "failed to reset $WT branch onto origin/$BRANCH" >&2
+    exit 6
+  }
+elif git rev-parse --verify origin/main >/dev/null 2>&1; then
+  git checkout -B "$BRANCH" origin/main >/dev/null 2>&1 || {
     echo "failed to reset $WT branch onto origin/main" >&2
     exit 6
   }

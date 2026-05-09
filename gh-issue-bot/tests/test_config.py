@@ -25,11 +25,11 @@ def test_defaults_when_no_env_file(tmp_bot_root):
     assert isinstance(cfg, Config)
     assert cfg.label == "auto-fix"
     assert cfg.fail_label == "auto-fix-failed"
-    assert cfg.max_parallel == 3
+    assert cfg.max_parallel == 1
     assert cfg.poll_interval == 600
     assert cfg.daily_cap == 10
     assert cfg.max_diff_lines == 2000
-    assert cfg.branch_prefix == "auto-fix/issue-"
+    assert cfg.branch_prefix == "auto-fix"
 
 
 def test_overrides_from_env_file(tmp_bot_root):

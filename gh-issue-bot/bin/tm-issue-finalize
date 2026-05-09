@@ -21,24 +21,23 @@ ISSUE="$1"
 [ -n "${TM_BOT_ROOT:-}" ]              || { echo "TM_BOT_ROOT unset" >&2; exit 2; }
 MAX_DIFF="${TM_ISSUE_MAX_DIFF_LINES:-2000}"
 
-# 1. cwd lock — must resolve inside TM_BOT_ROOT/worktrees/issue-<N>
-# This runs before all other env checks so cwd errors surface first.
+# Unified-branch lock: cwd must resolve to TM_BOT_ROOT/worktrees/$BRANCH
+# and HEAD branch must exactly equal $BRANCH (== TM_ISSUE_BRANCH_PREFIX).
+[ -n "${TM_ISSUE_BRANCH_PREFIX:-}" ]   || { echo "TM_ISSUE_BRANCH_PREFIX unset" >&2; exit 2; }
 CWD_REAL="$(cd "$PWD" && pwd -P)"
 BOT_ROOT_REAL="$(cd "$TM_BOT_ROOT" 2>/dev/null && pwd -P)" \
   || { echo "finalize refused: TM_BOT_ROOT '$TM_BOT_ROOT' does not exist; cwd not in expected worktree" >&2; exit 10; }
-WT_REQUIRED="${BOT_ROOT_REAL}/worktrees/issue-${ISSUE}"
+WT_REQUIRED="${BOT_ROOT_REAL}/worktrees/${TM_ISSUE_BRANCH_PREFIX}"
 if [ "$CWD_REAL" != "$WT_REQUIRED" ]; then
   echo "finalize refused: cwd '$CWD_REAL' is not the expected worktree '$WT_REQUIRED'" >&2
   exit 10
 fi
 
-# 2. Branch prefix env check + branch lock (before TM_GH_REPO so branch errors surface early)
-[ -n "${TM_ISSUE_BRANCH_PREFIX:-}" ]   || { echo "TM_ISSUE_BRANCH_PREFIX unset" >&2; exit 2; }
 HEAD_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-case "$HEAD_BRANCH" in
-  "$TM_ISSUE_BRANCH_PREFIX"*) ;;
-  *) echo "finalize refused: HEAD branch '$HEAD_BRANCH' lacks prefix '$TM_ISSUE_BRANCH_PREFIX'" >&2; exit 11 ;;
-esac
+if [ "$HEAD_BRANCH" != "$TM_ISSUE_BRANCH_PREFIX" ]; then
+  echo "finalize refused: HEAD branch '$HEAD_BRANCH' is not the expected unified branch '$TM_ISSUE_BRANCH_PREFIX'" >&2
+  exit 11
+fi
 
 # 3. Remaining env validation (after structural checks)
 [ -n "${TM_GH_REPO:-}" ]               || { echo "TM_GH_REPO unset" >&2; exit 2; }

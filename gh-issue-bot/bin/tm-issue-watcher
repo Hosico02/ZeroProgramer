@@ -155,8 +155,11 @@ def cmd_tick(args) -> int:
             cancelled += 1
         elif a["op"] == "promote":
             num = a["number"]
-            branch = f"{cfg.branch_prefix}{num}"
-            wt = bot_root / "worktrees" / f"issue-{num}"
+            # Unified-branch model: all issue fixes accumulate on a single
+            # shared branch (default "auto-fix"); worktree path mirrors the
+            # branch name (no per-issue dir).
+            branch = cfg.branch_prefix
+            wt = bot_root / "worktrees" / cfg.branch_prefix
             try:
                 if os.environ.get("TM_DRY_RUN") != "1":
                     _create_worktree(_repo_path(), wt, branch)

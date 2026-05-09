@@ -11,7 +11,7 @@ from lib.watcher_logic import (
 def _cfg(**overrides):
     base = dict(repo="o/r", label="auto-fix", fail_label="auto-fix-failed",
                 max_parallel=3, poll_interval=600, daily_cap=10,
-                max_diff_lines=2000, branch_prefix="auto-fix/issue-")
+                max_diff_lines=2000, branch_prefix="auto-fix")
     base.update(overrides)
     return Config(**base)
 

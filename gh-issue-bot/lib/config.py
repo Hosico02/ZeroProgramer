@@ -34,11 +34,14 @@ class Config:
 _DEFAULTS = {
     "TM_ISSUE_LABEL": "auto-fix",
     "TM_ISSUE_FAIL_LABEL": "auto-fix-failed",
-    "TM_ISSUE_MAX_PARALLEL": "3",
+    "TM_ISSUE_MAX_PARALLEL": "1",
     "TM_ISSUE_POLL_INTERVAL": "600",
     "TM_ISSUE_DAILY_CAP": "10",
     "TM_ISSUE_MAX_DIFF_LINES": "2000",
-    "TM_ISSUE_BRANCH_PREFIX": "auto-fix/issue-",
+    # Single shared branch (no per-issue suffix). Despite the field name,
+    # this is the literal branch name. All issue fixes accumulate here,
+    # one shared PR.
+    "TM_ISSUE_BRANCH_PREFIX": "auto-fix",
 }
 
 
