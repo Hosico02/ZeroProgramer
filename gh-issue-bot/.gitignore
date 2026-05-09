@@ -10,6 +10,7 @@ nags/
 escalations/
 worktrees/
 state.json
+resolve-*.log
 watcher.log
 .gh-issue-bot.env
 .disabled
