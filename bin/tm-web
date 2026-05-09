@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""tm-web — browser version of `tm-pm watch`.
+"""tm-web — browser dashboard for ZeroProgramer.
 
-Serves a single-page dashboard that polls /api/state every second,
-showing live PM state, recent events, escalations, status reports,
-decisions. All data is read-only from the project's runtime files.
+Two tabs:
+  迭代项目 — PM state, team control buttons (start/+executor/stop), workers,
+            tasks, recent events, status reports / decisions / proposals
+            (click-to-view markdown content).
+  Issue 管理 — gh-sync loop heartbeat (countdown to next sync), escalation
+              → GitHub issue map, recent sync log.
+
+Topbar always shows the cc-budget meter (5h/7d utilization), replacing the
+retired Claude Code statusLine.
 
 Stdlib only — no Flask, no React, no build step. Just python http.server.
 
@@ -20,6 +26,7 @@ import json
 import os
 import re
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -36,15 +43,29 @@ DECISIONS_DIR = ROOT / "decisions"
 STATUS_REPORTS_DIR = ROOT / "status-reports"
 PROPOSALS_DIR = ROOT / "proposals"
 PID_FILE = ROOT / "pm.pid"
+AGENT_PIDS_DIR = ROOT / "pids"
+AGENT_LOGS_DIR = ROOT / "logs"
+GH_MAP_FILE = ROOT / ".gh-issue-map.json"
+GH_SYNC_LOG = ROOT / "gh-sync.log"
+GH_SYNC_PID = ROOT / "gh-sync.pid"
+GH_SYNC_STATUS = ROOT / "gh-sync.status.json"
 
-# cc-budget — global Claude Code rate-limit meter. Same files the
-# (now-retired) statusLine read; we surface it in the dashboard instead.
+PTY_BG = ROOT / "bin" / "_tm-pty-bg.py"
+WRAPPER_SUPERVISOR = ROOT / "bin" / "tm-claude-supervisor"
+WRAPPER_EXECUTOR = ROOT / "bin" / "tm-claude-executor"
+
+# cc-budget — global Claude Code rate-limit meter.
 CC_BUDGET_CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "cc-budget"
 CC_BUDGET_FILE = CC_BUDGET_CACHE_DIR / "budget.json"
 CC_BUDGET_DAEMON_PID = CC_BUDGET_CACHE_DIR / "daemon.pid"
-CC_BUDGET_STALE_SEC = 15 * 60  # cache older than this → render as stale
+CC_BUDGET_STALE_SEC = 15 * 60
+
+# File viewer is sandboxed to these directories — never let the browser
+# read arbitrary files via /api/file?path=...
+FILE_VIEWER_DIRS = (ESC_DIR, DECISIONS_DIR, STATUS_REPORTS_DIR, PROPOSALS_DIR)
 
 
+# ============================================================ helpers ===
 def daemon_running() -> bool:
     if not PID_FILE.exists():
         return False
@@ -74,33 +95,44 @@ def tail_log(path: Path, n: int = 30) -> list[str]:
         return []
 
 
+def list_dir_md(d: Path, n: int = 12) -> list[dict]:
+    if not d.is_dir():
+        return []
+    items = sorted(
+        (p for p in d.iterdir() if p.is_file() and p.suffix == ".md"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:n]
+    out = []
+    for p in items:
+        try:
+            first = p.read_text(errors="ignore").splitlines()[0]
+        except Exception:
+            first = "(unreadable)"
+        title = first.lstrip("# ").strip() or p.stem
+        out.append({
+            "name": p.name,
+            "title": title,
+            "rel_path": str(p.relative_to(ROOT)),
+            "mtime": int(p.stat().st_mtime),
+        })
+    return out
+
+
 def read_cc_budget() -> dict:
-    """Read cc-budget's cached rate-limit data and the daemon's liveness.
-    Returns a dict with shape:
-      { "available": bool,
-        "stale": bool,                 # cache > CC_BUDGET_STALE_SEC old
-        "daemon_alive": bool,
-        "ts": int|None,                # cache write time (epoch)
-        "age_sec": int|None,           # how old the cache is right now
-        "h5_pct": float|None,          # 0..1, 5h utilization
-        "h5_reset": int|None,          # epoch when 5h window resets
-        "d7_pct": float|None,          # 0..1, 7d utilization
-        "d7_reset": int|None }         # epoch when 7d window resets
-    """
     out = {
         "available": False, "stale": False, "daemon_alive": False,
         "ts": None, "age_sec": None,
         "h5_pct": None, "h5_reset": None,
         "d7_pct": None, "d7_reset": None,
     }
-    # daemon liveness
     if CC_BUDGET_DAEMON_PID.exists():
         try:
             pid = int(CC_BUDGET_DAEMON_PID.read_text().strip())
             os.kill(pid, 0)
             out["daemon_alive"] = True
         except Exception:
-            out["daemon_alive"] = False
+            pass
     if not CC_BUDGET_FILE.exists():
         return out
     try:
@@ -136,144 +168,654 @@ def read_cc_budget() -> dict:
     return out
 
 
-def list_dir_md(d: Path, n: int = 8) -> list[dict]:
-    if not d.is_dir():
-        return []
-    items = sorted(
-        (p for p in d.iterdir() if p.is_file() and p.suffix == ".md"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:n]
-    out = []
-    for p in items:
+def read_gh_sync() -> dict:
+    """gh-sync loop status. Combines the JSON status (if alive) with the
+    .gh-issue-map.json mapping and a tail of gh-sync.log."""
+    out = {
+        "loop_alive": False,
+        "interval_sec": 1800,
+        "last_run_ts": None,
+        "next_run_ts": None,
+        "state": "stopped",
+        "last_result": "n/a",
+        "mapping": {},
+        "escalations_on_disk": 0,
+        "log_tail": [],
+        "map_mtime": None,
+    }
+    if GH_SYNC_PID.exists():
         try:
-            first = p.read_text(errors="ignore").splitlines()[0]
+            pid = int(GH_SYNC_PID.read_text().strip())
+            os.kill(pid, 0)
+            out["loop_alive"] = True
         except Exception:
-            first = "(unreadable)"
-        title = first.lstrip("# ").strip() or p.stem
-        out.append({"name": p.name, "title": title})
+            pass
+    if GH_SYNC_STATUS.exists():
+        try:
+            d = json.loads(GH_SYNC_STATUS.read_text())
+            for k in ("interval_sec", "last_run_ts", "next_run_ts", "state", "last_result"):
+                if k in d:
+                    out[k] = d[k]
+        except Exception:
+            pass
+    if GH_MAP_FILE.exists():
+        try:
+            out["mapping"] = json.loads(GH_MAP_FILE.read_text())
+            out["map_mtime"] = int(GH_MAP_FILE.stat().st_mtime)
+        except Exception:
+            pass
+    if ESC_DIR.is_dir():
+        out["escalations_on_disk"] = sum(
+            1 for p in ESC_DIR.glob("task-*.md") if p.is_file()
+        )
+    out["log_tail"] = tail_log(GH_SYNC_LOG, 25)
     return out
 
 
-INDEX_HTML = """<!doctype html>
-<html lang="en">
+def detect_repo() -> str | None:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2,
+        )
+        url = r.stdout.strip()
+        if not url:
+            return None
+        m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", url)
+        return m.group(1) if m else url
+    except Exception:
+        return None
+
+
+_REPO_CACHE = None
+_REPO_RESOLVED = False
+
+
+def cached_repo() -> str | None:
+    global _REPO_CACHE, _REPO_RESOLVED
+    if _REPO_RESOLVED:
+        return _REPO_CACHE
+    _REPO_CACHE = detect_repo()
+    _REPO_RESOLVED = True
+    return _REPO_CACHE
+
+
+# ============================================================ agents ===
+def scan_agents() -> list[dict]:
+    """List currently-running agents based on pids/agent-*.pid files."""
+    out = []
+    if not AGENT_PIDS_DIR.is_dir():
+        return out
+    for pf in sorted(AGENT_PIDS_DIR.glob("agent-*.pid")):
+        try:
+            pid = int(pf.read_text().strip())
+        except Exception:
+            continue
+        alive = False
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except Exception:
+            pass
+        if not alive:
+            # Stale pidfile — leave on disk so user can spot crash, but skip in list.
+            continue
+        label = pf.stem.replace("agent-", "")  # e.g. "supervisor" or "executor-2"
+        role = "supervisor" if label.startswith("supervisor") else (
+            "planner" if label.startswith("planner") else "executor"
+        )
+        try:
+            mtime = int(pf.stat().st_mtime)
+        except Exception:
+            mtime = None
+        out.append({
+            "label": label,
+            "role": role,
+            "pid": pid,
+            "started_ts": mtime,
+            "log": f"logs/agent-{label}.log",
+        })
+    return out
+
+
+def has_supervisor() -> bool:
+    return any(a["role"] == "supervisor" for a in scan_agents())
+
+
+def next_executor_index() -> int:
+    used = set()
+    for a in scan_agents():
+        if a["role"] == "executor":
+            m = re.search(r"executor-(\d+)$", a["label"])
+            if m:
+                used.add(int(m.group(1)))
+    n = 1
+    while n in used:
+        n += 1
+    return n
+
+
+def spawn_agent(label: str, wrapper: Path) -> dict:
+    """Daemonize wrapper via _tm-pty-bg.py. Returns {ok, pid|error}."""
+    AGENT_LOGS_DIR.mkdir(exist_ok=True)
+    AGENT_PIDS_DIR.mkdir(exist_ok=True)
+    log = AGENT_LOGS_DIR / f"agent-{label}.log"
+    pidf = AGENT_PIDS_DIR / f"agent-{label}.pid"
+    # If the pid file exists and the process is alive, refuse — let caller decide.
+    if pidf.exists():
+        try:
+            old = int(pidf.read_text().strip())
+            os.kill(old, 0)
+            return {"ok": False, "error": f"already running (pid {old})", "pid": old}
+        except Exception:
+            pidf.unlink(missing_ok=True)
+    try:
+        subprocess.run(
+            [sys.executable, str(PTY_BG), str(log), str(pidf), str(wrapper), "go"],
+            check=True, timeout=5,
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    # _tm-pty-bg.py daemonizes; wait for the pidfile to appear.
+    for _ in range(30):
+        if pidf.exists() and pidf.stat().st_size > 0:
+            try:
+                pid = int(pidf.read_text().strip())
+                return {"ok": True, "pid": pid, "label": label}
+            except Exception:
+                pass
+        time.sleep(0.1)
+    return {"ok": False, "error": "pid file never appeared"}
+
+
+def stop_all_agents() -> dict:
+    stopped = []
+    if not AGENT_PIDS_DIR.is_dir():
+        return {"ok": True, "stopped": stopped}
+    for pf in list(AGENT_PIDS_DIR.glob("agent-*.pid")):
+        try:
+            pid = int(pf.read_text().strip())
+            os.kill(pid, 15)  # SIGTERM
+            stopped.append({"label": pf.stem.replace("agent-", ""), "pid": pid})
+        except Exception:
+            pass
+        # Best-effort cleanup; _tm-pty-bg.py removes pidfile on its own exit.
+    # Give them a moment to exit, then collect lingerers.
+    time.sleep(0.4)
+    for pf in list(AGENT_PIDS_DIR.glob("agent-*.pid")):
+        try:
+            pid = int(pf.read_text().strip())
+            try:
+                os.kill(pid, 0)
+                # Still alive after SIGTERM — leave the pidfile, user sees the issue.
+            except Exception:
+                pf.unlink(missing_ok=True)
+        except Exception:
+            pf.unlink(missing_ok=True)
+    return {"ok": True, "stopped": stopped}
+
+
+# ============================================================ HTTP ===
+INDEX_HTML = r"""<!doctype html>
+<html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>tm-web · ZeroProgramer dashboard</title>
+<title>ZeroProgramer · dashboard</title>
 <style>
-  :root { --bg:#0e1116; --fg:#e6edf3; --muted:#7d8590; --green:#3fb950; --red:#f85149; --yellow:#d29922; --blue:#58a6ff; --magenta:#bc8cff; --card:#161b22; --border:#30363d; }
+  :root {
+    --bg:#0d1117; --bg2:#161b22; --bg3:#1f242c;
+    --fg:#e6edf3; --muted:#8b949e; --dim:#6e7681;
+    --green:#3fb950; --red:#f85149; --yellow:#d29922; --blue:#58a6ff;
+    --magenta:#bc8cff; --cyan:#76e3ea;
+    --border:#30363d; --accent:#58a6ff;
+  }
   * { box-sizing: border-box; }
-  body { background:var(--bg); color:var(--fg); font-family: -apple-system,SF Mono,Menlo,Consolas,monospace; margin:0; padding:1.5rem; font-size:13px; line-height:1.5; }
-  h1 { margin:0 0 .5rem; font-size:1.2rem; }
-  h2 { margin:1.2rem 0 .5rem; font-size:1rem; color:var(--muted); border-bottom:1px solid var(--border); padding-bottom:.3rem; }
-  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:1rem; }
-  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-  .card { background:var(--card); border:1px solid var(--border); border-radius:6px; padding:1rem; }
-  .card h2 { margin-top:0; }
-  .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; }
+  body {
+    background:var(--bg); color:var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", sans-serif;
+    margin:0; padding:0; font-size:13px; line-height:1.5;
+  }
+  .mono { font-family: "SF Mono", Menlo, Consolas, monospace; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+
+  /* topbar */
+  .topbar {
+    background:var(--bg2); border-bottom:1px solid var(--border);
+    padding: .8rem 1.2rem;
+    display:flex; align-items:center; gap:1rem; flex-wrap:wrap;
+  }
+  .topbar h1 { margin:0; font-size:1.05rem; font-weight:600; }
+  .topbar .ts { color:var(--muted); font-size:.85rem; margin-left:auto; }
+  .topbar .budget { display:flex; gap:.4rem; align-items:center; }
+
+  /* tabs */
+  .tabs {
+    display:flex; gap:0; padding: 0 1rem;
+    background:var(--bg2); border-bottom:1px solid var(--border);
+  }
+  .tab {
+    padding: .65rem 1.2rem; cursor:pointer; user-select:none;
+    color:var(--muted); border-bottom:2px solid transparent;
+    font-size:.9rem;
+  }
+  .tab:hover { color:var(--fg); }
+  .tab.active { color:var(--fg); border-bottom-color:var(--accent); font-weight:500; }
+
+  /* page */
+  .page { padding: 1rem 1.2rem; }
+  .grid { display:grid; gap: 1rem; grid-template-columns: 1fr 1fr; }
+  .grid-3 { display:grid; gap:1rem; grid-template-columns: 1fr 1fr 1fr; }
+  .full { grid-column: 1 / -1; }
+  @media (max-width: 920px) {
+    .grid, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  /* card */
+  .card {
+    background:var(--bg2); border:1px solid var(--border); border-radius:8px;
+    padding: .9rem 1rem;
+  }
+  .card h2 {
+    margin: 0 0 .6rem; font-size:.78rem; font-weight:600;
+    color:var(--muted); text-transform:uppercase; letter-spacing:.05em;
+    display:flex; align-items:center; gap:.5rem;
+  }
+  .card h2 .small { text-transform:none; letter-spacing:normal; font-weight:normal; }
+
+  /* pills + dots */
+  .pill {
+    display:inline-block; padding: 2px 8px; border-radius:10px;
+    font-size:11px; font-weight:600;
+  }
   .pill.green { background:rgba(63,185,80,.15); color:var(--green); }
   .pill.red { background:rgba(248,81,73,.15); color:var(--red); }
   .pill.yellow { background:rgba(210,153,34,.15); color:var(--yellow); }
   .pill.blue { background:rgba(88,166,255,.15); color:var(--blue); }
-  .pill.muted { background:rgba(125,133,144,.15); color:var(--muted); }
-  table { width:100%; border-collapse:collapse; }
-  th, td { padding:.4rem .5rem; text-align:left; border-bottom:1px solid var(--border); vertical-align:top; }
-  th { color:var(--muted); font-weight:normal; font-size:11px; text-transform:uppercase; }
-  tr:last-child td { border-bottom:none; }
-  pre { background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:.6rem; margin:0; overflow-x:auto; max-height:200px; font-size:11px; line-height:1.4; }
-  .mono { font-family:inherit; }
-  .truncate { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:480px; }
-  .small { color:var(--muted); font-size:11px; }
-  .header { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:1rem; }
+  .pill.muted { background:rgba(125,133,144,.18); color:var(--muted); }
   .dot.green { color:var(--green); }
+  .dot.red { color:var(--red); }
   .dot.muted { color:var(--muted); }
+
+  /* progress bar */
+  .pbar {
+    display:inline-block; vertical-align:middle;
+    width:140px; height:8px; background:rgba(125,133,144,.18);
+    border-radius:4px; overflow:hidden; margin: 0 .4rem;
+  }
+  .pbar .fill { height:100%; transition:width .3s; }
+  .pbar .fill.green { background:var(--green); }
+  .pbar .fill.yellow { background:var(--yellow); }
+  .pbar .fill.red { background:var(--red); }
+  .pbar.big { width:100%; height:6px; margin: .4rem 0; }
+
+  /* tables */
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td {
+    padding: .35rem .5rem; text-align:left;
+    border-bottom:1px solid var(--border); vertical-align:top;
+  }
+  th {
+    color:var(--muted); font-weight:500; font-size:10.5px;
+    text-transform:uppercase; letter-spacing:.04em;
+  }
+  tr:last-child td { border-bottom:none; }
+  td.mono { font-family: "SF Mono", Menlo, monospace; font-size:11.5px; }
+  .truncate {
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    max-width: 480px;
+  }
+
+  /* buttons */
+  .btn {
+    display:inline-flex; align-items:center; gap:.35rem;
+    padding: .4rem .85rem; border-radius:6px;
+    border:1px solid var(--border); background:var(--bg3);
+    color:var(--fg); font-size:.85rem; cursor:pointer; user-select:none;
+    transition: background .15s, border-color .15s;
+  }
+  .btn:hover:not(:disabled) { background:#262c36; border-color:var(--dim); }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .btn.primary { background:#1f6feb; border-color:#1f6feb; color:white; }
+  .btn.primary:hover:not(:disabled) { background:#388bfd; border-color:#388bfd; }
+  .btn.danger { color:var(--red); }
+  .btn.danger:hover:not(:disabled) { background:rgba(248,81,73,.1); border-color:var(--red); }
+
+  /* number input */
+  input.num {
+    width:3.5rem; padding:.35rem .5rem; border-radius:6px;
+    border:1px solid var(--border); background:var(--bg3);
+    color:var(--fg); font-size:.85rem;
+    text-align:center;
+  }
+  input.num:focus { outline:none; border-color:var(--accent); }
+
+  /* control row */
+  .control {
+    display:flex; flex-wrap:wrap; gap:.6rem; align-items:center;
+  }
+  .control label { color:var(--muted); }
+  .control .spacer { flex:1; }
+
+  /* lists */
+  ul.clean { list-style:none; padding:0; margin:0; }
+  ul.clean li {
+    padding: .35rem .5rem; border-radius:4px;
+    cursor:pointer;
+    display:flex; gap:.5rem; align-items:baseline;
+  }
+  ul.clean li:hover { background:var(--bg3); }
+  ul.clean li .name { color:var(--muted); font-size:11px; min-width:8.5rem; font-family:"SF Mono",monospace; }
+  ul.clean li .title { flex:1; }
+
+  /* preformatted */
+  pre {
+    background:var(--bg); border:1px solid var(--border); border-radius:6px;
+    padding:.6rem .7rem; margin:0; overflow:auto; max-height:240px;
+    font-size:11px; line-height:1.45;
+    font-family: "SF Mono", Menlo, monospace;
+  }
+
+  /* role colors in workers */
   .role-supervisor { color:var(--magenta); }
   .role-planner { color:var(--blue); }
   .role-executor { color:var(--green); }
-  .role-default { color:var(--muted); }
-  ul { margin: .3rem 0; padding-left: 1.2rem; }
-  li { margin: .2rem 0; }
+
+  /* modal */
+  .modal-bg {
+    position:fixed; inset:0; background:rgba(0,0,0,.55);
+    z-index:50; display:none; align-items:center; justify-content:center;
+  }
+  .modal-bg.show { display:flex; }
+  .modal {
+    background:var(--bg2); border:1px solid var(--border); border-radius:10px;
+    width: min(820px, 92vw); max-height:86vh; overflow:hidden;
+    display:flex; flex-direction:column;
+  }
+  .modal header {
+    padding:.85rem 1.1rem; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:.6rem;
+  }
+  .modal header .title { flex:1; font-weight:600; }
+  .modal header .name { color:var(--muted); font-family:"SF Mono",monospace; font-size:11.5px; }
+  .modal header .close {
+    cursor:pointer; color:var(--muted);
+    padding:.2rem .5rem; border-radius:4px;
+  }
+  .modal header .close:hover { background:var(--bg3); color:var(--fg); }
+  .modal .body {
+    padding:1rem 1.2rem; overflow:auto; flex:1;
+  }
+  .modal .body pre {
+    max-height:none; background:var(--bg);
+    white-space:pre-wrap; word-wrap:break-word;
+  }
+
+  /* tab content visibility */
+  .tab-content { display:none; }
+  .tab-content.active { display:block; }
+
+  /* toast */
+  .toast {
+    position:fixed; right:1rem; bottom:1rem;
+    background:var(--bg3); border:1px solid var(--border); border-radius:6px;
+    padding:.6rem 1rem; font-size:.85rem; z-index:60;
+    transition:opacity .2s; opacity:0; pointer-events:none;
+  }
+  .toast.show { opacity:1; }
+  .toast.ok { border-color:var(--green); }
+  .toast.err { border-color:var(--red); }
 </style>
 </head>
 <body>
-  <div class="header">
+  <div class="topbar">
     <h1 id="proj">— · loading…</h1>
-    <div class="small">refreshes every 1s · <span id="ts">—</span></div>
+    <div id="budget-row" class="budget"></div>
+    <div class="ts" id="ts">—</div>
   </div>
 
-  <div class="grid">
-    <div class="card" style="grid-column: 1 / -1;">
-      <h2>Claude budget · account-wide</h2>
-      <div id="cc-budget" class="small">—</div>
+  <div class="tabs">
+    <div class="tab active" data-tab="iter">迭代项目</div>
+    <div class="tab" data-tab="issues">Issue 管理</div>
+  </div>
+
+  <!-- ─────────────── 迭代项目 tab ─────────────── -->
+  <div class="page tab-content active" data-tab="iter">
+
+    <!-- Team Control -->
+    <div class="card" style="margin-bottom:1rem;">
+      <h2>Team Control <span class="small" id="team-summary">—</span></h2>
+      <div class="control">
+        <label>Executors:</label>
+        <input id="n-executors" class="num" type="number" min="1" max="8" value="1">
+        <button id="btn-start" class="btn primary">▶ 启动</button>
+        <button id="btn-add" class="btn">+ executor</button>
+        <button id="btn-stop" class="btn danger">■ 停止</button>
+        <span class="spacer"></span>
+        <span class="small" id="pm-status">PM —</span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Progress</h2>
+        <div id="progress"></div>
+      </div>
+      <div class="card">
+        <h2>Workers</h2>
+        <table id="workers-table"><tbody></tbody></table>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:1rem;">
+      <div class="card">
+        <h2>Tasks <span class="small">(latest 15)</span></h2>
+        <table id="tasks-table">
+          <thead><tr><th>#</th><th>status</th><th>title</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Recent PM events</h2>
+        <pre id="recent-events">—</pre>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:1rem;">
+      <div class="card">
+        <h2>Status reports <span class="small">click to view</span></h2>
+        <ul id="status-reports" class="clean"></ul>
+      </div>
+      <div class="card">
+        <h2>Decisions log <span class="small">click to view</span></h2>
+        <ul id="decisions" class="clean"></ul>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:1rem;">
+      <div class="card full">
+        <h2>Vision proposals <span class="small">awaiting supervisor review · click to view</span></h2>
+        <ul id="proposals" class="clean"></ul>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:1rem;">
+      <div class="card full">
+        <h2>Recent supervisor decisions <span class="small">log tail</span></h2>
+        <pre id="supervisor-log">—</pre>
+      </div>
     </div>
   </div>
 
-  <div class="grid">
-    <div class="card">
-      <h2>Progress</h2>
-      <div id="progress"></div>
+  <!-- ─────────────── Issue 管理 tab ─────────────── -->
+  <div class="page tab-content" data-tab="issues">
+
+    <div class="card" style="margin-bottom:1rem;">
+      <h2>gh-sync loop <span class="small" id="repo-label">—</span></h2>
+      <div class="control" style="margin-bottom:.6rem;">
+        <span id="loop-status">—</span>
+        <span class="spacer"></span>
+        <button id="btn-sync-now" class="btn">立即同步</button>
+      </div>
+      <div id="loop-countdown" class="small">—</div>
     </div>
 
-    <div class="card">
-      <h2>Workers</h2>
-      <table id="workers-table"><tbody></tbody></table>
+    <div class="grid">
+      <div class="card">
+        <h2>Escalation → Issue mapping</h2>
+        <table id="issue-map">
+          <thead><tr><th>file</th><th>issue</th><th>title</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div id="issue-summary" class="small" style="margin-top:.5rem;color:var(--muted);">—</div>
+      </div>
+
+      <div class="card">
+        <h2>Open escalations <span class="small">on disk</span></h2>
+        <ul id="escalations" class="clean"></ul>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:1rem;">
+      <div class="card full">
+        <h2>gh-sync.log <span class="small">last 25 entries</span></h2>
+        <pre id="sync-log">—</pre>
+      </div>
     </div>
   </div>
 
-  <div class="grid">
-    <div class="card">
-      <h2>Tasks</h2>
-      <table id="tasks-table">
-        <thead><tr><th>#</th><th>status</th><th>title</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-
-    <div class="card">
-      <h2>Recent PM events</h2>
-      <pre id="recent-events">—</pre>
+  <!-- modal -->
+  <div id="modal-bg" class="modal-bg">
+    <div class="modal">
+      <header>
+        <div class="title" id="modal-title">—</div>
+        <div class="name mono" id="modal-name">—</div>
+        <div class="close" id="modal-close">✕</div>
+      </header>
+      <div class="body" id="modal-body">loading…</div>
     </div>
   </div>
 
-  <div class="grid">
-    <div class="card">
-      <h2>Open escalations</h2>
-      <ul id="escalations"></ul>
-    </div>
-
-    <div class="card">
-      <h2>Recent supervisor decisions</h2>
-      <pre id="supervisor-log">—</pre>
-    </div>
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <h2>Status reports</h2>
-      <ul id="status-reports"></ul>
-    </div>
-
-    <div class="card">
-      <h2>Decisions log (ADR)</h2>
-      <ul id="decisions"></ul>
-    </div>
-  </div>
-
-  <div class="grid">
-    <div class="card" style="grid-column: 1 / -1;">
-      <h2>Vision proposals (awaiting supervisor review)</h2>
-      <ul id="proposals"></ul>
-    </div>
-  </div>
+  <!-- toast -->
+  <div id="toast" class="toast">—</div>
 
 <script>
 const $ = id => document.getElementById(id);
 
+let LATEST_STATE = null;
+
+// ─── tab switching ───
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    const tab = t.dataset.tab;
+    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
+    document.querySelectorAll('.tab-content').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
+  });
+});
+
+// ─── helpers ───
+function escape_html(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+function pct_class(p) { return p >= 0.85 ? "red" : (p >= 0.6 ? "yellow" : "green"); }
+function fmt_until(epoch) {
+  if (!epoch) return "—";
+  const secs = epoch - Math.floor(Date.now() / 1000);
+  if (secs <= 0) return "now";
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  if (h >= 24) return `${Math.floor(h/24)}d${h%24}h`;
+  if (h)      return `${h}h${String(m).padStart(2,"0")}m`;
+  if (m)      return `${m}m${String(s).padStart(2,"0")}s`;
+  return `${s}s`;
+}
+function fmt_ago(epoch) {
+  if (!epoch) return "—";
+  const secs = Math.floor(Date.now() / 1000) - epoch;
+  if (secs < 60) return secs + "s ago";
+  if (secs < 3600) return Math.floor(secs/60) + "m ago";
+  return Math.floor(secs/3600) + "h ago";
+}
+
+// ─── toast ───
+let toastTimer = null;
+function toast(msg, kind="ok") {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show " + kind;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.className = "toast " + kind, 2400);
+}
+
+// ─── modal ───
+$("modal-close").addEventListener("click", () => $("modal-bg").classList.remove("show"));
+$("modal-bg").addEventListener("click", e => {
+  if (e.target === $("modal-bg")) $("modal-bg").classList.remove("show");
+});
+async function open_file(rel_path, title) {
+  $("modal-title").textContent = title;
+  $("modal-name").textContent = rel_path;
+  $("modal-body").innerHTML = "<pre>loading…</pre>";
+  $("modal-bg").classList.add("show");
+  try {
+    const r = await fetch("/api/file?path=" + encodeURIComponent(rel_path));
+    if (!r.ok) {
+      const txt = await r.text();
+      $("modal-body").innerHTML = "<pre>error: " + escape_html(txt) + "</pre>";
+      return;
+    }
+    const txt = await r.text();
+    $("modal-body").innerHTML = "<pre>" + escape_html(txt) + "</pre>";
+  } catch (e) {
+    $("modal-body").innerHTML = "<pre>fetch failed: " + escape_html(String(e)) + "</pre>";
+  }
+}
+
+// ─── team control ───
+async function team_action(path, body) {
+  try {
+    const r = await fetch("/api/team/" + path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: body ? JSON.stringify(body) : "{}",
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast(d.message || "ok", "ok");
+    } else {
+      toast(d.error || "failed", "err");
+    }
+    refresh();
+  } catch (e) {
+    toast("network: " + e, "err");
+  }
+}
+$("btn-start").addEventListener("click", () => {
+  const n = parseInt($("n-executors").value, 10) || 1;
+  team_action("start", {executors: n});
+});
+$("btn-add").addEventListener("click", () => team_action("add-executor"));
+$("btn-stop").addEventListener("click", () => {
+  if (confirm("停止全部 agents？")) team_action("stop");
+});
+$("btn-sync-now").addEventListener("click", async () => {
+  toast("running tm-github-sync …", "ok");
+  try {
+    const r = await fetch("/api/sync-now", {method: "POST"});
+    const d = await r.json();
+    toast(d.ok ? "synced" : (d.error || "failed"), d.ok ? "ok" : "err");
+    refresh();
+  } catch (e) {
+    toast("network: " + e, "err");
+  }
+});
+
+// ─── refresh ───
 async function refresh() {
   try {
     const r = await fetch("/api/state");
     if (!r.ok) throw new Error("HTTP " + r.status);
     const s = await r.json();
+    LATEST_STATE = s;
     render(s);
   } catch (e) {
     $("proj").textContent = "(server unreachable)";
@@ -281,56 +823,101 @@ async function refresh() {
 }
 
 function render(s) {
+  // ── topbar ──
   const dot = s.daemon_running ? '<span class="dot green">●</span>' : '<span class="dot muted">○</span>';
-  $("proj").innerHTML = `${dot} ${s.project} <span class="small">· role-aware multi-agent dashboard</span>`;
+  $("proj").innerHTML = `${dot} ${escape_html(s.project)}`;
   $("ts").textContent = new Date().toLocaleTimeString();
+  $("pm-status").innerHTML = s.daemon_running
+    ? '<span class="pill green">PM running</span>'
+    : '<span class="pill muted">PM stopped</span>';
 
-  // cc-budget
-  $("cc-budget").innerHTML = render_budget(s.cc_budget || {});
+  // ── budget pill ──
+  const b = s.cc_budget || {};
+  if (b.available && b.h5_pct != null) {
+    const cls5 = pct_class(b.h5_pct);
+    const cls7 = pct_class(b.d7_pct || 0);
+    $("budget-row").innerHTML =
+      `<span class="pill ${cls5}">5h ${(b.h5_pct*100).toFixed(0)}%</span>` +
+      `<span class="pill ${cls7}">7d ${(b.d7_pct ? b.d7_pct*100 : 0).toFixed(0)}%</span>` +
+      (b.stale ? '<span class="pill yellow">stale</span>' : '');
+  } else {
+    $("budget-row").innerHTML = '<span class="small" style="color:var(--muted);">budget cache n/a</span>';
+  }
 
+  // ── team summary + buttons ──
+  const agents = s.agents || [];
+  const sup = agents.find(a => a.role === "supervisor");
+  const execs = agents.filter(a => a.role === "executor");
+  $("team-summary").textContent = sup
+    ? `· 1 supervisor + ${execs.length} executor(s) running`
+    : "· no agents running";
+  $("btn-start").disabled = !!sup;
+  $("btn-add").disabled = !sup;
+  $("btn-stop").disabled = agents.length === 0;
+
+  // ── progress ──
   const ts = s.tasks || [];
   const done = ts.filter(t => t.status === "done").length;
   const inpg = ts.filter(t => t.status === "in-progress").length;
   const fail = ts.filter(t => t.status === "failed").length;
   const todo = ts.length - done - inpg - fail;
   const pct = ts.length ? Math.round(100 * done / ts.length) : 0;
-  $("progress").innerHTML = `
-    <div style="font-size:1.5rem; margin-bottom:.5rem;">${done}<span class="small">/${ts.length}</span> <span class="pill ${done === ts.length && ts.length ? 'green' : 'blue'}">${pct}%</span></div>
-    <div>
-      <span class="pill green">${done} done</span>
-      <span class="pill yellow">${inpg} in-progress</span>
-      <span class="pill muted">${todo} todo</span>
-      ${fail ? `<span class="pill red">${fail} failed</span>` : ""}
-    </div>
-  `;
+  $("progress").innerHTML =
+    `<div style="font-size:1.55rem; margin-bottom:.4rem;">
+       ${done}<span class="small" style="color:var(--muted);">/${ts.length}</span>
+       <span class="pill ${done === ts.length && ts.length ? 'green' : 'blue'}" style="margin-left:.5rem;">${pct}%</span>
+     </div>
+     <div class="pbar big"><div class="fill ${pct >= 100 ? 'green' : 'yellow'}" style="width:${pct}%"></div></div>
+     <div>
+       <span class="pill green">${done} done</span>
+       <span class="pill yellow">${inpg} in-progress</span>
+       <span class="pill muted">${todo} todo</span>
+       ${fail ? `<span class="pill red">${fail} failed</span>` : ""}
+     </div>`;
 
-  // workers
+  // ── workers (combine pm-state.workers + scanned agents) ──
   const wTbody = $("workers-table").querySelector("tbody");
-  const ws = s.workers || {};
-  const wEntries = Object.entries(ws);
-  if (!wEntries.length) {
-    wTbody.innerHTML = '<tr><td colspan="4" class="small">(no workers registered)</td></tr>';
+  const stateWorkers = Object.entries(s.workers || {});
+  if (!stateWorkers.length && !agents.length) {
+    wTbody.innerHTML = '<tr><td colspan="4" class="small" style="color:var(--muted);">(no workers — click ▶ 启动 above)</td></tr>';
   } else {
-    wTbody.innerHTML = wEntries.map(([sid, w]) => {
+    // Prefer pm-state info; supplement with agents that haven't joined PM yet.
+    const seenSids = new Set(stateWorkers.map(([sid]) => sid));
+    const rows = stateWorkers.map(([sid, w]) => {
       const role = w.role || "executor";
       const cur = w.current_task_id != null ? `task #${w.current_task_id}` : "—";
       return `<tr>
         <td class="mono">${sid.slice(0,12)}</td>
         <td class="role-${role}">${role}</td>
-        <td>${w.status}</td>
+        <td>${escape_html(w.status || "?")}</td>
         <td>${cur}</td>
       </tr>`;
-    }).join("");
+    });
+    // Add agents pre-PM-join (rare but happens on first start)
+    agents.forEach(a => {
+      if (!stateWorkers.some(([_, w]) => (w.label || "") === a.label)) {
+        // not in state — show as starting
+        rows.push(`<tr>
+          <td class="mono">pid ${a.pid}</td>
+          <td class="role-${a.role}">${a.role}</td>
+          <td><span class="small">starting…</span></td>
+          <td>—</td>
+        </tr>`);
+      }
+    });
+    wTbody.innerHTML = rows.join("") || '<tr><td colspan="4" class="small">—</td></tr>';
   }
 
-  // tasks
+  // ── tasks ──
   const tTbody = $("tasks-table").querySelector("tbody");
   if (!ts.length) {
-    tTbody.innerHTML = '<tr><td colspan="3" class="small">(no tasks)</td></tr>';
+    tTbody.innerHTML = '<tr><td colspan="3" class="small" style="color:var(--muted);">(no tasks yet — supervisor will plan once agents start)</td></tr>';
   } else {
     const mark = { done:"✓", "in-progress":"▶", failed:"✗", todo:"·" };
     tTbody.innerHTML = ts.slice(-15).map(t => {
-      const cls = t.status === "done" ? "green" : t.status === "in-progress" ? "yellow" : t.status === "failed" ? "red" : "muted";
+      const cls = t.status === "done" ? "green"
+                : t.status === "in-progress" ? "yellow"
+                : t.status === "failed" ? "red" : "muted";
       return `<tr>
         <td>#${t.id}</td>
         <td><span class="pill ${cls}">${mark[t.status] || "?"} ${t.status}</span></td>
@@ -339,72 +926,88 @@ function render(s) {
     }).join("");
   }
 
-  // recent events
-  $("recent-events").textContent = (s.recent_events || []).join("\\n") || "(no events)";
+  $("recent-events").textContent = (s.recent_events || []).join("\n") || "(no events)";
+  $("supervisor-log").textContent = (s.supervisor_recent || []).join("\n") || "(no supervisor decisions yet)";
 
-  // escalations
+  // ── click-to-view file lists ──
+  fill_file_list("status-reports", s.status_reports || [], "Status report");
+  fill_file_list("decisions", s.decisions || [], "Decision");
+  fill_file_list("proposals", s.proposals || [], "Proposal");
+
+  // escalations: just show name (we render mapping in Issue tab)
   const escUl = $("escalations");
   const escs = s.escalations || [];
-  escUl.innerHTML = escs.length ? escs.map(e => `<li class="mono">${escape_html(e.name)} — ${escape_html(e.title)}</li>`).join("") : '<li class="small">(none) ✓</li>';
-
-  // supervisor log
-  $("supervisor-log").textContent = (s.supervisor_recent || []).join("\\n") || "(no supervisor decisions yet)";
-
-  // status reports
-  const srUl = $("status-reports");
-  const srs = s.status_reports || [];
-  srUl.innerHTML = srs.length ? srs.map(r => `<li class="mono">${escape_html(r.name)}</li>`).join("") : '<li class="small">(none yet)</li>';
-
-  // decisions
-  const dUl = $("decisions");
-  const ds = s.decisions || [];
-  dUl.innerHTML = ds.length ? ds.map(d => `<li class="mono">${escape_html(d.name)} — ${escape_html(d.title)}</li>`).join("") : '<li class="small">(none yet)</li>';
-
-  // proposals
-  const pUl = $("proposals");
-  const ps = s.proposals || [];
-  pUl.innerHTML = ps.length ? ps.map(p => `<li class="mono">${escape_html(p.name)} — ${escape_html(p.title)}</li>`).join("") : '<li class="small">(none — try ./bin/tm-vision propose)</li>';
-}
-
-function escape_html(s) {
-  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
-}
-
-function fmt_until(epoch) {
-  if (!epoch) return "—";
-  const secs = epoch - Math.floor(Date.now() / 1000);
-  if (secs <= 0) return "now";
-  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
-  if (h >= 24) return `${Math.floor(h/24)}d${h%24}h`;
-  if (h)      return `${h}h${String(m).padStart(2,"0")}m`;
-  return `${m}m`;
-}
-
-function render_budget(b) {
-  if (!b || !b.available) {
-    const dpid = b && b.daemon_alive ? '<span class="pill green">daemon ●</span>' : '<span class="pill muted">daemon ○</span>';
-    return `${dpid} <span class="small">no cache yet — check ~/.cache/cc-budget/budget.json or run <code>cc-budget install</code></span>`;
+  if (!escs.length) {
+    escUl.innerHTML = '<li class="small" style="color:var(--muted);">(none) ✓</li>';
+  } else {
+    escUl.innerHTML = escs.map(e =>
+      `<li onclick='open_file(${JSON.stringify(e.rel_path)}, ${JSON.stringify("Escalation")})'>` +
+      `<span class="name">${escape_html(e.name)}</span><span class="title">${escape_html(e.title)}</span></li>`
+    ).join("");
   }
-  const pct_class = p => p >= 0.85 ? "red" : (p >= 0.6 ? "yellow" : "green");
-  const bar = p => {
-    const cls = pct_class(p);
-    const pct = Math.min(100, Math.round(p * 100));
-    return `<div style="display:inline-block;vertical-align:middle;width:140px;height:8px;background:rgba(125,133,144,.18);border-radius:4px;overflow:hidden;margin:0 .4rem;">
-      <div style="height:100%;width:${pct}%;background:var(--${cls === 'red' ? 'red' : cls === 'yellow' ? 'yellow' : 'green'});"></div>
-    </div>`;
-  };
-  const stale = b.stale ? '<span class="pill yellow">stale</span>' : '';
-  const dpid = b.daemon_alive ? '<span class="pill green">daemon ●</span>' : '<span class="pill red">daemon ○</span>';
-  const h5 = b.h5_pct == null ? '<span class="small">5h —</span>'
-    : `<span class="pill ${pct_class(b.h5_pct)}">5h ${(b.h5_pct*100).toFixed(0)}%</span>${bar(b.h5_pct)}<span class="small">resets ${fmt_until(b.h5_reset)}</span>`;
-  const d7 = b.d7_pct == null ? '<span class="small">7d —</span>'
-    : `<span class="pill ${pct_class(b.d7_pct)}">7d ${(b.d7_pct*100).toFixed(0)}%</span>${bar(b.d7_pct)}<span class="small">resets ${fmt_until(b.d7_reset)}</span>`;
-  const age = b.age_sec == null ? '' : ` · cache ${b.age_sec}s old`;
-  return `<div style="display:flex;flex-wrap:wrap;gap:1rem;align-items:center;">
-    <div>${h5}</div>
-    <div>${d7}</div>
-    <div>${dpid} ${stale}<span class="small">${age}</span></div>
-  </div>`;
+
+  // ── Issue 管理 tab ──
+  $("repo-label").textContent = "· repo: " + (s.repo || "(no remote)");
+  const gh = s.gh_sync || {};
+  const dot2 = gh.loop_alive ? '<span class="dot green">●</span>' : '<span class="dot muted">○</span>';
+  const stateStr = gh.loop_alive
+    ? `loop alive · state: <span class="pill ${gh.last_result === 'failed' ? 'red' : (gh.state === 'running' ? 'yellow' : 'green')}">${gh.state} (${gh.last_result})</span>`
+    : 'loop not running';
+  $("loop-status").innerHTML = `${dot2} ${stateStr}`;
+
+  const intervalMin = Math.round((gh.interval_sec || 1800) / 60);
+  if (gh.loop_alive && gh.next_run_ts) {
+    $("loop-countdown").innerHTML =
+      `interval: every ${intervalMin} min · next sync in <strong>${fmt_until(gh.next_run_ts)}</strong> · last run ${fmt_ago(gh.last_run_ts)}`;
+  } else {
+    $("loop-countdown").innerHTML = `interval: ${intervalMin} min · loop stopped — start with <code>./bin/tm-gh-sync-loop --forever &amp;</code>`;
+  }
+
+  // mapping table
+  const mapTbody = $("issue-map").querySelector("tbody");
+  const mapping = gh.mapping || {};
+  const entries = Object.entries(mapping);
+  if (!entries.length) {
+    mapTbody.innerHTML = '<tr><td colspan="3" class="small" style="color:var(--muted);">(no mapping yet — runs after first escalation)</td></tr>';
+  } else {
+    const repo_url = s.repo ? `https://github.com/${s.repo}/issues/` : null;
+    mapTbody.innerHTML = entries.map(([fname, info]) => {
+      let num, title = "", state = "";
+      if (info && typeof info === "object") {
+        num = info.number || info.issue || "—";
+        title = info.title || "";
+        state = info.state || "";
+      } else { num = info; }
+      const issueCell = repo_url
+        ? `<a href="${repo_url}${num}" target="_blank">#${num}</a>` + (state ? ` <span class="pill muted">${escape_html(state)}</span>` : "")
+        : `#${num}` + (state ? ` (${escape_html(state)})` : "");
+      return `<tr>
+        <td class="mono">${escape_html(fname)}</td>
+        <td>${issueCell}</td>
+        <td class="truncate" title="${escape_html(title)}">${escape_html(title)}</td>
+      </tr>`;
+    }).join("");
+  }
+  const onDisk = gh.escalations_on_disk || 0;
+  const mappedCount = entries.length;
+  const mapMtime = gh.map_mtime ? fmt_ago(gh.map_mtime) : "(never)";
+  $("issue-summary").textContent = `escalations on disk: ${onDisk} · mapped: ${mappedCount} · last sync wrote map: ${mapMtime}`;
+
+  $("sync-log").textContent = (gh.log_tail || []).join("\n") || "(no sync activity yet)";
+}
+
+function fill_file_list(id, items, kind) {
+  const ul = $(id);
+  if (!items.length) {
+    ul.innerHTML = '<li class="small" style="color:var(--muted);">(none yet)</li>';
+    return;
+  }
+  ul.innerHTML = items.map(it =>
+    `<li onclick='open_file(${JSON.stringify(it.rel_path)}, ${JSON.stringify(kind + ": " + it.title)})'>` +
+    `<span class="name">${escape_html(it.name)}</span>` +
+    `<span class="title">${escape_html(it.title)}</span>` +
+    `</li>`
+  ).join("");
 }
 
 refresh();
@@ -415,20 +1018,47 @@ setInterval(refresh, 1000);
 """
 
 
+# ============================================================ HTTP impl ===
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a, **kw):
         pass  # silence default access logs
 
+    # ---- routing ----
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == "/" or path == "/index.html":
+        u = urllib.parse.urlparse(self.path)
+        path = u.path
+        if path in ("/", "/index.html"):
             return self._send(200, "text/html; charset=utf-8", INDEX_HTML.encode())
         if path == "/api/state":
-            payload = self._build_state()
-            return self._send(200, "application/json",
-                              json.dumps(payload).encode())
+            return self._send_json(200, self._build_state())
+        if path == "/api/file":
+            return self._serve_file(u.query)
         return self._send(404, "text/plain", b"not found")
 
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
+        path = u.path
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            length = 0
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if path == "/api/team/start":
+            return self._send_json(200, self._team_start(data))
+        if path == "/api/team/add-executor":
+            return self._send_json(200, self._team_add_executor())
+        if path == "/api/team/stop":
+            return self._send_json(200, self._team_stop())
+        if path == "/api/sync-now":
+            return self._send_json(200, self._sync_now())
+        return self._send(404, "text/plain", b"not found")
+
+    # ---- impl ----
     def _send(self, code, ctype, body):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -437,22 +1067,100 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, code, payload):
+        return self._send(code, "application/json", json.dumps(payload).encode())
+
     def _build_state(self) -> dict:
         s = read_state()
         return {
             "project": ROOT.name,
+            "repo": cached_repo(),
             "daemon_running": daemon_running(),
             "tasks": s.get("tasks", []),
             "workers": s.get("workers", {}),
+            "agents": scan_agents(),
             "recent_events": tail_log(LOG_FILE, 20),
-            "supervisor_recent": tail_log(SUPERVISOR_LOG, 8),
-            "escalations": list_dir_md(ESC_DIR, 10),
-            "status_reports": list_dir_md(STATUS_REPORTS_DIR, 8),
-            "decisions": list_dir_md(DECISIONS_DIR, 8),
-            "proposals": list_dir_md(PROPOSALS_DIR, 8),
+            "supervisor_recent": tail_log(SUPERVISOR_LOG, 12),
+            "escalations": list_dir_md(ESC_DIR, 12),
+            "status_reports": list_dir_md(STATUS_REPORTS_DIR, 10),
+            "decisions": list_dir_md(DECISIONS_DIR, 10),
+            "proposals": list_dir_md(PROPOSALS_DIR, 10),
             "cc_budget": read_cc_budget(),
+            "gh_sync": read_gh_sync(),
             "ts": datetime.datetime.utcnow().isoformat() + "Z",
         }
+
+    def _serve_file(self, query: str):
+        params = urllib.parse.parse_qs(query)
+        rel = (params.get("path") or [""])[0]
+        if not rel:
+            return self._send(400, "text/plain", b"missing ?path=")
+        try:
+            target = (ROOT / rel).resolve()
+        except Exception:
+            return self._send(400, "text/plain", b"bad path")
+        # Sandbox: must be inside one of the allowed dirs.
+        ok = False
+        for d in FILE_VIEWER_DIRS:
+            try:
+                target.relative_to(d.resolve())
+                ok = True
+                break
+            except (ValueError, FileNotFoundError):
+                continue
+        if not ok:
+            return self._send(403, "text/plain", b"outside allowed dirs")
+        if not target.is_file():
+            return self._send(404, "text/plain", b"not found")
+        try:
+            data = target.read_bytes()
+        except Exception as e:
+            return self._send(500, "text/plain", f"read failed: {e}".encode())
+        return self._send(200, "text/plain; charset=utf-8", data)
+
+    # ---- team control ----
+    def _team_start(self, data: dict) -> dict:
+        if has_supervisor():
+            return {"ok": False, "error": "supervisor already running"}
+        try:
+            n = int(data.get("executors", 1))
+        except Exception:
+            n = 1
+        n = max(0, min(n, 8))
+        results = []
+        sup = spawn_agent("supervisor", WRAPPER_SUPERVISOR)
+        results.append({"role": "supervisor", **sup})
+        if not sup.get("ok"):
+            return {"ok": False, "error": "supervisor: " + sup.get("error", "?"), "results": results}
+        for i in range(1, n + 1):
+            r = spawn_agent(f"executor-{i}", WRAPPER_EXECUTOR)
+            results.append({"role": "executor", "n": i, **r})
+        return {"ok": True, "message": f"started supervisor + {n} executor(s)", "results": results}
+
+    def _team_add_executor(self) -> dict:
+        if not has_supervisor():
+            return {"ok": False, "error": "no supervisor running — click ▶ 启动 first"}
+        n = next_executor_index()
+        r = spawn_agent(f"executor-{n}", WRAPPER_EXECUTOR)
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error", "?")}
+        return {"ok": True, "message": f"added executor-{n} (pid {r.get('pid')})", "result": r}
+
+    def _team_stop(self) -> dict:
+        r = stop_all_agents()
+        return {"ok": True, "message": f"stopped {len(r['stopped'])} agent(s)", **r}
+
+    def _sync_now(self) -> dict:
+        try:
+            res = subprocess.run(
+                [str(ROOT / "bin" / "tm-github-sync")],
+                cwd=str(ROOT), capture_output=True, text=True, timeout=120,
+            )
+            if res.returncode != 0:
+                return {"ok": False, "error": (res.stderr or res.stdout or "non-zero exit")[:300]}
+            return {"ok": True, "message": (res.stdout or "synced").strip()[:300]}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
 
 class ReusableServer(socketserver.ThreadingTCPServer):
@@ -477,8 +1185,6 @@ def main() -> int:
             print(f"tm-web: unknown arg {arg!r}", file=sys.stderr)
             return 1
 
-    # Try the requested port; if busy, walk forward up to MAX_TRIES.
-    # --strict-port disables this fallback for scripts that need an exact port.
     MAX_TRIES = 1 if strict_port else 10
     server = None
     last_err = None
@@ -490,26 +1196,19 @@ def main() -> int:
             break
         except OSError as e:
             last_err = e
-            # errno 48 (mac) / 98 (linux) = address in use
             if e.errno not in (48, 98):
-                # not a port-busy error — bail
                 print(f"tm-web: bind to :{try_port} failed: {e}", file=sys.stderr)
                 return 2
             if attempt == 0 and not strict_port:
                 print(f"⚠ port {try_port} busy; trying {try_port+1}…", file=sys.stderr)
 
     if server is None:
-        print(f"tm-web: no free port in {port}..{port+MAX_TRIES-1}: {last_err}",
-              file=sys.stderr)
-        if not strict_port:
-            print("  hint: another tm-web is probably running. Stop it first, or pass --strict-port",
-                  file=sys.stderr)
+        print(f"tm-web: no free port in {port}..{port+MAX_TRIES-1}: {last_err}", file=sys.stderr)
         return 3
 
     url = f"http://localhost:{port}/"
     print(f"✓ tm-web listening on {url}  (Ctrl+C to stop)")
     if open_browser:
-        # delay so the server is up before the browser hits it
         threading.Timer(0.3, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()

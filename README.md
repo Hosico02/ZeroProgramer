@@ -120,22 +120,49 @@ cp -r ~/source/* workspace/           # populate workspace with code to be manag
 
 ### Start / stop
 
+Two launch flows depending on how you want to spawn agents:
+
 ```bash
-./bin/tm-team-up [N]              # one-command launch (default: 1 executor; pass 2 or 3 for parallel)
+# Dashboard-driven: PM + helpers + browser, NO agents. Click ▶ 启动 in
+# the dashboard to spawn supervisor + 1 executor; use + executor / ■ 停止
+# to scale up or wind down. Recommended for interactive sessions.
+./bin/tm-pm-up
+
+# One-shot: bring up everything immediately (agents start auto-go).
+./bin/tm-team-up [N]              # default: 1 executor; pass 2 or 3 for parallel
+
+# Stopping
 ./bin/tm-pm shutdown "<reason>"   # graceful (lets in-flight tasks finish)
 ./bin/tm-pm stop                  # force-stop daemon
 ./bin/tm-pm reset                 # wipe runtime state and start over
-TM_TEAM_DOWN=1 ./bin/tm-team-up   # hard tear-down (kills agents + watchdog + gh-sync loop)
+TM_TEAM_DOWN=1 ./bin/tm-pm-up     # hard tear-down (PM + watchdog + gh-sync + agents)
+TM_TEAM_DOWN=1 ./bin/tm-team-up   # same; either works
 ```
 
-`tm-team-up` (default GUI mode) brings up four background helpers:
+Both flows bring up the same four background helpers:
 
 | Helper | Started by default | Skip with | Purpose |
 |---|---|---|---|
 | **PM daemon** | yes | — | Dispatches tasks to workers (zero-token state machine) |
 | **PM watchdog** | yes | `--no-watchdog` | Auto-restarts PM on crash (rate-limited 5/60s) |
-| **gh-sync loop** | yes (auto-skip if no `gh` CLI) | `--no-gh-sync` | Mirrors `escalations/` to GitHub Issues every 10 min |
+| **gh-sync loop** | yes (auto-skip if no `gh` CLI) | `--no-gh-sync` | Mirrors `escalations/` to GitHub Issues every 30 min |
 | **tm-web dashboard** | yes | `--no-dashboard` | Browser dashboard auto-opens at `localhost:7891` |
+
+### Browser dashboard
+
+`tm-web` (auto-launched by `tm-pm-up` / `tm-team-up`) is the primary control surface. Two tabs:
+
+- **迭代项目** — Team Control card with `▶ 启动` / `+ executor` / `■ 停止` buttons (drives the same `_tm-pty-bg.py` spawn path that `tm-team-up` uses), live workers + tasks, click-to-view modal for status reports / decisions / vision proposals, recent PM events log. Topbar shows PM dot + Claude budget pills (5h / 7d).
+- **Issue 管理** — gh-sync loop heartbeat with countdown to next sync, escalation→issue mapping (linkable to GitHub when remote is detected), `立即同步` button, last 25 sync log entries.
+
+POST endpoints (also usable from CLI / curl):
+
+```bash
+curl -X POST http://localhost:7891/api/team/start -d '{"executors": 2}'
+curl -X POST http://localhost:7891/api/team/add-executor
+curl -X POST http://localhost:7891/api/team/stop
+curl -X POST http://localhost:7891/api/sync-now
+```
 
 ### Monitor (run in any spare terminal — zero token cost)
 
@@ -232,7 +259,7 @@ project/
 ├── goal-history/            # snapshot of goal.md before each L6 revision
 ├── escalations/             # tasks that permanently failed (auto-mirrored to GitHub Issues)
 ├── .gh-issue-map.json       # escalation file → live GitHub issue number (managed by tm-github-sync)
-├── gh-sync.log              # periodic-sync result log (one entry per 10 min)
+├── gh-sync.log              # periodic-sync result log (one entry per 30 min)
 ├── workspace/               # the code executors actually edit
 ├── pm.log                   # PM event stream
 ├── supervisor.log           # supervisor decisions
@@ -270,14 +297,14 @@ escalations/task-0042.md  ←── auto-mirrored ──→  github.com/<owner>/
 
 ### How it runs
 
-`tm-team-up` (default GUI mode) starts a background **`tm-gh-sync-loop`** alongside the PM daemon and watchdog. The loop calls `tm-github-sync` once at startup, then every `TM_GH_SYNC_INTERVAL` seconds (default 600 = 10 min). Result: opening or closing escalations propagates to GitHub within ~10 min, no manual cron.
+`tm-pm-up` and `tm-team-up` (default mode) both start a background **`tm-gh-sync-loop`** alongside the PM daemon and watchdog. The loop calls `tm-github-sync` once at startup, then every `TM_GH_SYNC_INTERVAL` seconds (default 1800 = 30 min). Result: opening or closing escalations propagates to GitHub within ~30 min, no manual cron.
 
 Auto-skip rules — the loop **silently skips** any iteration when:
 - `gh` CLI isn't on `PATH` (install from <https://cli.github.com/>)
 - `TM_GH_ENABLED=0` is set (project is on GitLab / Bitbucket / not hosted)
 - `git remote get-url origin` doesn't yield a GitHub URL
 
-So safe to leave on for non-GitHub projects — it just no-ops every 10 min.
+So safe to leave on for non-GitHub projects — it just no-ops every 30 min.
 
 ### One-shot or dry-run
 
@@ -304,7 +331,7 @@ Currently one-way (`escalations → issues`). Coming work in `vision.md`: revers
 | `TM_GH_ENABLED` | `1` | Set to `0` to disable sync entirely (loop becomes no-op) |
 | `TM_GH_REPO` | from `git remote` | Override target repo, e.g. `owner/repo` |
 | `TM_GH_LABEL` | `tm-escalation` | GitHub label attached to opened issues |
-| `TM_GH_SYNC_INTERVAL` | `600` | Seconds between loop iterations |
+| `TM_GH_SYNC_INTERVAL` | `1800` | Seconds between loop iterations |
 
 ---
 
@@ -433,7 +460,8 @@ export TM_MODEL_VERIFIER=claude-haiku-4-5-20251001
 bin/
 ├── pm-daemon.py              # background PM
 ├── tm-pm                     # PM control (start/stop/status/watch/...)
-├── tm-team-up                # one-shot full-team launch
+├── tm-pm-up                  # PM + helpers + browser, NO agents (dashboard-driven flow)
+├── tm-team-up                # one-shot: PM + helpers + agents (start everything immediately)
 ├── tm-init                   # install framework into target dir
 ├── tm-claude-supervisor      # spawn supervisor window
 ├── tm-claude-planner         # spawn planner window (opt-in, 4-agent mode only)
@@ -450,7 +478,7 @@ bin/
 ├── tm-context                # task / history queries
 ├── tm-vision                 # innovation channel: add / propose / list / show / edit
 ├── tm-github-sync            # one-shot mirror of escalations → GitHub Issues
-├── tm-gh-sync-loop           # background daemon that calls tm-github-sync every 10 min
+├── tm-gh-sync-loop           # background daemon that calls tm-github-sync every 30 min
 ├── tm-web                    # browser dashboard (single-page, polls /api/state, shows Claude budget)
 ├── tm-dashboard              # native tkinter dashboard (--native; experimental on macOS)
 ├── tm-title-keeper           # live window-title refresher

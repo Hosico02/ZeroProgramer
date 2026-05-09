@@ -16,7 +16,7 @@
 #   tm-gh-sync-loop --forever &  # background; tm-team-up uses this form
 #
 # Env:
-#   TM_GH_SYNC_INTERVAL    seconds between syncs (default: 600 = 10min)
+#   TM_GH_SYNC_INTERVAL    seconds between syncs (default: 1800 = 30min)
 #   TM_GH_ENABLED          set to 0 to disable entirely (loop exits)
 #   TM_GH_REPO, TM_GH_LABEL  passed through to tm-github-sync
 set -euo pipefail
@@ -24,7 +24,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIDFILE="$ROOT/gh-sync.pid"
 LOG="$ROOT/gh-sync.log"
-INTERVAL="${TM_GH_SYNC_INTERVAL:-600}"
+STATUS="$ROOT/gh-sync.status.json"
+INTERVAL="${TM_GH_SYNC_INTERVAL:-1800}"
+
+# Write a small JSON snapshot so tm-web can render a countdown / health
+# without grepping the log. Updated on each iteration boundary.
+write_status() {
+  # $1 = state (idle|running|skipped), $2 = last_result (ok|failed|n/a)
+  local now next
+  now=$(date -u +%s)
+  next=$(( now + INTERVAL ))
+  cat > "$STATUS" <<EOF
+{"interval_sec": $INTERVAL, "last_run_ts": $now, "next_run_ts": $next, "state": "$1", "last_result": "$2", "pid": $$}
+EOF
+}
 
 # Only block --forever-style invocation; foreground for debugging is fine.
 forever=0
@@ -42,7 +55,7 @@ fi
 echo $$ > "$PIDFILE"
 
 cleanup() {
-  rm -f "$PIDFILE"
+  rm -f "$PIDFILE" "$STATUS"
 }
 trap 'cleanup; exit 0' TERM INT
 trap 'cleanup' EXIT
@@ -65,16 +78,20 @@ should_run_now() {
 log "started (interval=${INTERVAL}s, forever=${forever})"
 
 # First-iteration banner so the user can confirm it's alive even if the
-# first scheduled tick is 10 min away.
+# first scheduled tick is 30 min away.
 if should_run_now; then
   log "initial sync …"
+  write_status running n/a
   if "$ROOT/bin/tm-github-sync" >> "$LOG" 2>&1; then
     log "  ok"
+    write_status idle ok
   else
     log "  failed (exit $?)"
+    write_status idle failed
   fi
 else
   log "skipping initial sync (gh CLI missing or TM_GH_ENABLED=0)"
+  write_status skipped n/a
 fi
 
 # Foreground mode: run once and exit.
@@ -90,12 +107,16 @@ while :; do
 
   if should_run_now; then
     log "sync …"
+    write_status running n/a
     if "$ROOT/bin/tm-github-sync" >> "$LOG" 2>&1; then
       log "  ok"
+      write_status idle ok
     else
       log "  failed (exit $?)"
+      write_status idle failed
     fi
   else
     log "skip (gh CLI missing or TM_GH_ENABLED=0)"
+    write_status skipped n/a
   fi
 done

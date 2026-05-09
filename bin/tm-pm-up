@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# tm-pm-up — start the PM stack WITHOUT spawning agents.
+#
+# Use this when you want a dashboard-driven workflow: you bring up PM +
+# watchdog + gh-sync loop + tm-web, then click "▶ 启动" in the browser to
+# spawn supervisor + executors when you're ready. Add more executors via
+# the "+ executor" button.
+#
+# Compare to tm-team-up which spawns agents immediately.
+#
+# Steps:
+#   1. tm-pm reset            (wipe state)
+#   2. tm-pm start --forever  (background daemon)
+#   3. pm-watchdog --forever  (auto-restart on crash; --no-watchdog skips)
+#   4. tm-gh-sync-loop        (every 30 min by default; --no-gh-sync skips)
+#   5. tm-web                 (browser auto-opens at localhost:7891)
+#
+# Usage:
+#   tm-pm-up                  # full stack, no agents
+#   tm-pm-up --no-watchdog    # skip PM watchdog
+#   tm-pm-up --no-gh-sync     # skip GitHub sync loop
+#   tm-pm-up --no-dashboard   # don't open the browser dashboard
+#   TM_TEAM_DOWN=1 tm-pm-up   # tear down everything (PM + helpers + agents)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+want_watchdog=1
+want_gh_sync=1
+want_dashboard=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-watchdog)  want_watchdog=0 ;;
+    --no-gh-sync)   want_gh_sync=0 ;;
+    --no-dashboard) want_dashboard=0 ;;
+    -h|--help)      sed -n '2,22p' "$0"; exit 0 ;;
+    *) echo "tm-pm-up: unknown arg '$arg'" >&2; exit 1 ;;
+  esac
+done
+
+cd "$ROOT"
+mkdir -p logs pids
+
+# ---- helper: tear-down path ------------------------------------------------
+team_down_all() {
+  shopt -s nullglob
+  local stopped=0
+  for pf in pids/agent-*.pid; do
+    [ -f "$pf" ] || continue
+    if pid="$(cat "$pf" 2>/dev/null)" && [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      stopped=$((stopped + 1))
+    fi
+    rm -f "$pf"
+  done
+  if [ -f gh-sync.pid ]; then
+    if pid="$(cat gh-sync.pid 2>/dev/null)" && [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      stopped=$((stopped + 1))
+    fi
+    rm -f gh-sync.pid gh-sync.status.json
+  fi
+  if [ "$stopped" -gt 0 ]; then
+    echo "  stopped $stopped helper(s) / agent(s)"
+    sleep 0.4
+  fi
+  shopt -u nullglob
+}
+
+if [ "${TM_TEAM_DOWN:-0}" = "1" ]; then
+  echo "── tearing down PM stack ──"
+  team_down_all
+  ./bin/tm-pm stop || true
+  echo "✓ stack down"
+  exit 0
+fi
+
+# Idempotent re-run: stop any leftover agents from a previous run.
+team_down_all
+
+echo "── 1. resetting PM state ──"
+./bin/tm-pm reset >/dev/null
+
+echo "── 2. starting pm-daemon (--forever) ──"
+./bin/tm-pm start --forever | tail -n 2
+
+if [ "$want_watchdog" = "1" ]; then
+  echo "── 3. starting pm-watchdog (--forever, background) ──"
+  nohup ./bin/tm-pm watchdog --forever > "$ROOT/pm-watchdog.log" 2>&1 &
+  sleep 0.4
+  if [ -f "$ROOT/pm-watchdog.pid" ]; then
+    echo "✓ watchdog (pid $(cat "$ROOT/pm-watchdog.pid"))  log: pm-watchdog.log"
+  else
+    echo "⚠️  watchdog pidfile not written; check pm-watchdog.log" >&2
+  fi
+else
+  echo "── 3. watchdog SKIPPED (--no-watchdog) ──"
+fi
+
+if [ "$want_gh_sync" = "1" ] && [ "${TM_GH_ENABLED:-1}" != "0" ]; then
+  if command -v gh >/dev/null 2>&1; then
+    echo "── 4. starting gh-sync loop (--forever, background) ──"
+    nohup ./bin/tm-gh-sync-loop --forever > /dev/null 2>&1 &
+    sleep 0.3
+    if [ -f "$ROOT/gh-sync.pid" ]; then
+      interval="${TM_GH_SYNC_INTERVAL:-1800}"
+      echo "✓ gh-sync (pid $(cat "$ROOT/gh-sync.pid"))  every ${interval}s  log: gh-sync.log"
+    else
+      echo "⚠️  gh-sync pidfile not written; check gh-sync.log" >&2
+    fi
+  else
+    echo "── 4. gh-sync SKIPPED (gh CLI not in PATH) ──"
+  fi
+else
+  echo "── 4. gh-sync SKIPPED (--no-gh-sync or TM_GH_ENABLED=0) ──"
+fi
+
+if [ "$want_dashboard" = "1" ]; then
+  echo "── 5. opening dashboard (browser, auto-launches) ──"
+  nohup python3 "$ROOT/bin/tm-web" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  echo "  ✓ tm-web launched at http://localhost:7891"
+fi
+
+echo
+echo "✓ PM stack ready (no agents yet)"
+echo "  Click ▶ 启动 in the browser to spawn 1 supervisor + 1 executor"
+echo "  Use + executor to scale up; ■ 停止 to wind down"
+echo "  Hard tear-down:    TM_TEAM_DOWN=1 ./bin/tm-pm-up"
+echo "  PM events:         tail -f pm.log"
+echo "  gh-sync events:    tail -f gh-sync.log"
