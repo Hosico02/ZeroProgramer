@@ -29,45 +29,32 @@ def _make_worktree_with_diff(tmp_git_repo, bot_root, issue_num):
     return wt, branch
 
 
-def _stub_gh_in_path(tmp_path: Path, log_path: Path | None = None) -> Path:
-    """Drop a `gh` shim into a fresh dir; record every call to log_path if given."""
+def _stub_gh_in_path(tmp_path: Path, log_path: Path | None = None,
+                     pr_exists: bool = False) -> Path:
+    """Drop a `gh` shim. If pr_exists, `pr list` returns one PR (idempotency
+    check); otherwise empty and `pr create` returns a new PR URL."""
     bin_dir = tmp_path / "stubs"
     bin_dir.mkdir()
-    if log_path is not None:
-        body = textwrap.dedent(f"""\
-            #!/usr/bin/env bash
-            # Log the full command + the --body argument value (if any) for tests to inspect.
-            echo "ARGS: $@" >> "{log_path}"
-            for ((i=1; i<=$#; i++)); do
-              if [ "${{!i}}" = "--body" ]; then
-                j=$((i+1))
-                echo "BODY_BEGIN" >> "{log_path}"
-                echo "${{!j}}"     >> "{log_path}"
-                echo "BODY_END"   >> "{log_path}"
-              fi
-            done
-            case "$1 $2" in
-              "issue comment") echo "https://github.com/o/r/issues/1#issuecomment-1" ;;
-              *) ;;
-            esac
-            exit 0
-        """)
-    else:
-        body = textwrap.dedent("""\
-            #!/usr/bin/env bash
-            case "$1 $2" in
-              "issue comment") echo "https://github.com/o/r/issues/1#issuecomment-1" ;;
-              *) ;;
-            esac
-            exit 0
-        """)
+    pr_list_out = '[{"number":99}]' if pr_exists else "[]"
+    log_block = "" if log_path is None else f'echo "ARGS: $@" >> "{log_path}"\nfor ((i=1; i<=$#; i++)); do\n  if [ "${{!i}}" = "--body" ]; then\n    j=$((i+1)); echo "BODY_BEGIN" >> "{log_path}"; echo "${{!j}}" >> "{log_path}"; echo "BODY_END" >> "{log_path}"\n  fi\ndone'
+    body = textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        {log_block}
+        case "$1 $2" in
+          "pr list")        echo '{pr_list_out}' ;;
+          "pr create")      echo "https://github.com/o/r/pull/77" ;;
+          "issue comment")  echo "https://github.com/o/r/issues/1#issuecomment-1" ;;
+          *) ;;
+        esac
+        exit 0
+    """)
     (bin_dir / "gh").write_text(body)
     (bin_dir / "gh").chmod(0o755)
     return bin_dir
 
 
-def test_finalize_happy_path_pushes_and_comments(tmp_git_repo, tmp_bot_root, tmp_path):
-    """Branch is pushed; a structured comment is posted; NO PR is created."""
+def test_finalize_happy_path_pushes_pr_and_comments(tmp_git_repo, tmp_bot_root, tmp_path):
+    """Branch pushed, PR created, short pointer comment on issue."""
     issue = 1
     wt, branch = _make_worktree_with_diff(tmp_git_repo, tmp_bot_root, issue)
     _git("remote", "add", "origin", str(tmp_git_repo), cwd=wt)
@@ -81,25 +68,20 @@ def test_finalize_happy_path_pushes_and_comments(tmp_git_repo, tmp_bot_root, tmp
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
     env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
 
-    proc = subprocess.run(
-        [str(FINALIZE), str(issue)],
-        cwd=wt, env=env, capture_output=True, text=True,
-    )
+    proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
+                          capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr + proc.stdout
 
     log_text = gh_log.read_text()
-    # Comment was posted on the issue.
+    assert "pr list" in log_text
+    assert "pr create" in log_text
     assert f"issue comment {issue}" in log_text
-    # No PR was opened.
-    assert "pr create" not in log_text
-    assert "pr list" not in log_text
 
 
-def test_finalize_comment_body_includes_branch_commit_diffstat(
+def test_finalize_pr_body_includes_closes_diffstat_commit(
     tmp_git_repo, tmp_bot_root, tmp_path,
 ):
-    """The comment body IS the solution summary — must include branch name,
-    commit short SHA, and diff stat."""
+    """The PR body carries the 整体方案 — Closes #N + diff stat + commit msg."""
     issue = 7
     wt, branch = _make_worktree_with_diff(tmp_git_repo, tmp_bot_root, issue)
     _git("remote", "add", "origin", str(tmp_git_repo), cwd=wt)
@@ -117,12 +99,11 @@ def test_finalize_comment_body_includes_branch_commit_diffstat(
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr + proc.stdout
 
+    # Find the PR-create body (3rd BODY block: list, create, comment).
     log_text = gh_log.read_text()
-    body_match = log_text.split("BODY_BEGIN", 1)[1].split("BODY_END", 1)[0]
-    assert branch in body_match
-    assert "compare/main..." in body_match
-    assert "fix.txt" in body_match  # the file we changed appears in diff stat
-    assert "owner/repo" in body_match  # compare URL contains target repo
+    bodies = [seg.split("BODY_END", 1)[0] for seg in log_text.split("BODY_BEGIN")[1:]]
+    assert any(f"Closes #{issue}" in b for b in bodies)
+    assert any("fix.txt" in b for b in bodies)  # diff stat file
 
 
 def test_finalize_rejects_outside_worktree(tmp_path, monkeypatch):
@@ -173,28 +154,28 @@ def test_finalize_empty_diff_fails(tmp_git_repo, tmp_bot_root, tmp_path):
     assert "diff" in (proc.stderr + proc.stdout).lower()
 
 
-def test_finalize_rerun_is_idempotent(tmp_git_repo, tmp_bot_root, tmp_path):
-    """Running finalize twice on the same worktree produces 2 comments but
-    pushes nothing new the second time. The branch state on remote is
-    unchanged after the second run (no force-with-lease conflict)."""
+def test_finalize_idempotent_when_pr_exists(tmp_git_repo, tmp_bot_root, tmp_path):
+    """Re-running finalize when a PR already exists for this branch: skip
+    `pr create`, reuse PR number 99 from the stub's pr-list output."""
     issue = 4
     wt, branch = _make_worktree_with_diff(tmp_git_repo, tmp_bot_root, issue)
     _git("remote", "add", "origin", str(tmp_git_repo), cwd=wt)
     _git("config", "receive.denyCurrentBranch", "ignore", cwd=tmp_git_repo)
     gh_log = tmp_path / "gh.log"
-    stubs = _stub_gh_in_path(tmp_path, gh_log)
+    stubs = _stub_gh_in_path(tmp_path, gh_log, pr_exists=True)
     env = os.environ.copy()
     env["PATH"] = f"{stubs}:{env['PATH']}"
     env["TM_GH_REPO"] = "o/r"
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
     env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
 
-    p1 = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
-                        capture_output=True, text=True)
-    assert p1.returncode == 0, p1.stderr + p1.stdout
-    p2 = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
-                        capture_output=True, text=True)
-    assert p2.returncode == 0, p2.stderr + p2.stdout
+    proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    log_text = gh_log.read_text()
+    assert "pr list" in log_text
+    assert "pr create" not in log_text   # didn't re-create
+    assert "99" in (proc.stdout + proc.stderr)  # reused PR number
 
 
 def test_finalize_diff_too_large(tmp_git_repo, tmp_bot_root, tmp_path):

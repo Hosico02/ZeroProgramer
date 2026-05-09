@@ -2,11 +2,11 @@
 # tm-issue-finalize <issue-number>
 #
 # Called by tm-done as a task's signal_cmd. Run from inside the per-issue
-# worktree. On success: pushes the auto-fix branch, posts a structured
-# "solution summary" comment on the issue (commit, files, diff stat, review
-# URL), exits 0. Does NOT open a PR — user reviews/merges the branch via
-# GitHub's compare UI. On any safety/validation failure: exits non-zero
-# with a reason on stderr.
+# worktree. On success: pushes the auto-fix branch, opens a PR (idempotent)
+# with a structured "整体方案" body (commit msg, files, diff stat), posts a
+# short pointer comment on the issue, exits 0. PR is the artifact the owner
+# reviews against the issue — bot never auto-merges. On any safety/validation
+# failure: exits non-zero with a reason on stderr.
 #
 # Required env:
 #   TM_BOT_ROOT             absolute path to gh-issue-bot/
@@ -67,19 +67,30 @@ else
   git push -u origin "HEAD:$HEAD_BRANCH" >/dev/null
 fi
 
-# 6. Build "整体方案" comment — the single artifact the user sees. Pulls the
-# fixer session's commit message + diff stat so the comment IS the summary.
+# 6. Compose the "整体方案" — goes into the PR body so it shows up in the
+# review UI alongside the diff. Issue comment gets a short pointer.
 COMMIT_SHA="$(git log -1 --format=%H)"
 COMMIT_SHORT="${COMMIT_SHA:0:8}"
 COMMIT_SUBJECT="$(git log -1 --format=%s)"
 COMMIT_BODY="$(git log -1 --format=%b)"
 DIFF_STAT="$(git diff main --stat)"
-COMPARE_URL="https://github.com/${TM_GH_REPO}/compare/main...${HEAD_BRANCH}?expand=1"
 
-COMMENT_BODY="$(cat <<EOF
-**🤖 gh-issue-bot 已就此 issue 准备好了一个修复，待你 review/merge。**
+# Optional cost report (set by tm-issue-bot-resolve when calling us).
+COST_FOOTER=""
+COMMENT_COST_TAIL=""
+if [ -n "${TM_FIXER_COST_USD:-}" ]; then
+  COST_FOOTER="
 
-**分支**: \`${HEAD_BRANCH}\` &nbsp;·&nbsp; **commit**: \`${COMMIT_SHORT}\`
+### 成本
+
+\`\$${TM_FIXER_COST_USD}\` · ${TM_FIXER_TOKENS_IN:-?}↑ + ${TM_FIXER_TOKENS_OUT:-?}↓ tokens (cache c/r: ${TM_FIXER_CACHE_C:-?}/${TM_FIXER_CACHE_R:-?}) · ${TM_FIXER_DURATION:-?}s · ${TM_FIXER_TURNS:-?} turns · model \`${TM_FIXER_MODEL:-?}\`"
+  COMMENT_COST_TAIL=" · 成本 \$${TM_FIXER_COST_USD} (${TM_FIXER_TOKENS_IN:-?}↑+${TM_FIXER_TOKENS_OUT:-?}↓ tokens, ${TM_FIXER_DURATION:-?}s)"
+fi
+
+PR_BODY="$(cat <<EOF
+Closes #${ISSUE}
+
+**🤖 gh-issue-bot 自动修复 — 请 review 后 merge。**
 
 ### 修复说明
 
@@ -93,19 +104,27 @@ ${COMMIT_BODY:-_(commit 没写正文，仅有 subject)_}
 ${DIFF_STAT}
 \`\`\`
 
-### 你下一步该做的
+### Commit
 
-1. 看 diff: ${COMPARE_URL}
-2. 决定 merge / 放弃 / 手动调整
-3. merge 后建议手动 close 这个 issue（bot 不开 PR，所以 GitHub 不会自动关）
+\`${COMMIT_SHORT}\`${COST_FOOTER}
 
 ---
-_由 gh-issue-bot 在 worktree \`worktrees/issue-${ISSUE}/\` 内自动产出。bot 永不 auto-merge。_
+_由 gh-issue-bot 在 worktree \`worktrees/issue-${ISSUE}/\` 内自动产出。bot 永不 auto-merge —— 由 owner 根据 issue 自行确认。_
 EOF
 )"
 
-# 7. Post comment (idempotent enough — duplicate is annoying but not harmful;
-# the watcher's GC + the user's own merge are what really finalize this).
-gh issue comment "$ISSUE" --repo "$TM_GH_REPO" --body "$COMMENT_BODY" >/dev/null
+# 7. PR — open if missing, else reuse number (idempotent).
+PR_NUM=$(gh pr list --repo "$TM_GH_REPO" --head "$HEAD_BRANCH" --state open --json number 2>/dev/null \
+         | jq -r '.[0].number // empty' 2>/dev/null || true)
+if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "null" ]; then
+  PR_TITLE="Auto-fix #${ISSUE}: ${COMMIT_SUBJECT}"
+  PR_URL=$(gh pr create --repo "$TM_GH_REPO" --head "$HEAD_BRANCH" --base main \
+           --title "$PR_TITLE" --body "$PR_BODY")
+  PR_NUM=$(printf '%s' "$PR_URL" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | tail -1)
+fi
 
-echo "ok branch=$HEAD_BRANCH commit=$COMMIT_SHORT"
+# 8. Issue gets a short pointer; full solution lives in the PR body.
+gh issue comment "$ISSUE" --repo "$TM_GH_REPO" \
+  --body "🤖 已开 PR #${PR_NUM}（branch \`${HEAD_BRANCH}\`，commit \`${COMMIT_SHORT}\`），请 review 后决定是否 merge。完整修复说明见 PR 正文。${COMMENT_COST_TAIL}" >/dev/null
+
+echo "ok pr=$PR_NUM branch=$HEAD_BRANCH commit=$COMMIT_SHORT cost=${TM_FIXER_COST_USD:-n/a} dur=${TM_FIXER_DURATION:-n/a}s"
