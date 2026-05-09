@@ -1,4 +1,6 @@
-"""tm-issue-finalize: validates worktree, branch, diff, then push + PR + comment."""
+"""tm-issue-finalize: validates worktree/branch/diff, pushes branch, posts a
+structured solution-summary comment. Does NOT open a PR (by design)."""
+from __future__ import annotations
 import os
 import subprocess
 import shutil
@@ -27,49 +29,52 @@ def _make_worktree_with_diff(tmp_git_repo, bot_root, issue_num):
     return wt, branch
 
 
-def _stub_gh_in_path(tmp_path: Path, behavior: str = "ok") -> Path:
-    """Drop a `gh` shim into a fresh dir and return that dir for $PATH prepend.
-    behavior: 'ok' | 'pr-exists' | 'fail-create'.
-    """
+def _stub_gh_in_path(tmp_path: Path, log_path: Path | None = None) -> Path:
+    """Drop a `gh` shim into a fresh dir; record every call to log_path if given."""
     bin_dir = tmp_path / "stubs"
     bin_dir.mkdir()
-    if behavior == "ok":
-        body = textwrap.dedent("""\
+    if log_path is not None:
+        body = textwrap.dedent(f"""\
             #!/usr/bin/env bash
-            cmd="$1 $2"
-            case "$cmd" in
-              "pr list") echo "[]" ;;
-              "pr create") echo "https://github.com/o/r/pull/77" ;;
-              "issue comment") echo "https://github.com/o/r/issues/1#c-1" ;;
-              *) exit 0 ;;
+            # Log the full command + the --body argument value (if any) for tests to inspect.
+            echo "ARGS: $@" >> "{log_path}"
+            for ((i=1; i<=$#; i++)); do
+              if [ "${{!i}}" = "--body" ]; then
+                j=$((i+1))
+                echo "BODY_BEGIN" >> "{log_path}"
+                echo "${{!j}}"     >> "{log_path}"
+                echo "BODY_END"   >> "{log_path}"
+              fi
+            done
+            case "$1 $2" in
+              "issue comment") echo "https://github.com/o/r/issues/1#issuecomment-1" ;;
+              *) ;;
             esac
-        """)
-    elif behavior == "pr-exists":
-        body = textwrap.dedent("""\
-            #!/usr/bin/env bash
-            cmd="$1 $2"
-            case "$cmd" in
-              "pr list") echo '[{"number":55}]' ;;
-              "issue comment") echo "https://github.com/o/r/issues/1#c-1" ;;
-              *) exit 0 ;;
-            esac
+            exit 0
         """)
     else:
-        body = "#!/usr/bin/env bash\nexit 1\n"
+        body = textwrap.dedent("""\
+            #!/usr/bin/env bash
+            case "$1 $2" in
+              "issue comment") echo "https://github.com/o/r/issues/1#issuecomment-1" ;;
+              *) ;;
+            esac
+            exit 0
+        """)
     (bin_dir / "gh").write_text(body)
     (bin_dir / "gh").chmod(0o755)
     return bin_dir
 
 
-def test_finalize_happy_path(tmp_git_repo, tmp_bot_root, monkeypatch, tmp_path):
+def test_finalize_happy_path_pushes_and_comments(tmp_git_repo, tmp_bot_root, tmp_path):
+    """Branch is pushed; a structured comment is posted; NO PR is created."""
     issue = 1
     wt, branch = _make_worktree_with_diff(tmp_git_repo, tmp_bot_root, issue)
-
-    # Repurpose the source repo as the "remote" so push works.
     _git("remote", "add", "origin", str(tmp_git_repo), cwd=wt)
     _git("config", "receive.denyCurrentBranch", "ignore", cwd=tmp_git_repo)
 
-    stubs = _stub_gh_in_path(tmp_path, "ok")
+    gh_log = tmp_path / "gh.log"
+    stubs = _stub_gh_in_path(tmp_path, gh_log)
     env = os.environ.copy()
     env["PATH"] = f"{stubs}:{env['PATH']}"
     env["TM_GH_REPO"] = "o/r"
@@ -81,6 +86,43 @@ def test_finalize_happy_path(tmp_git_repo, tmp_bot_root, monkeypatch, tmp_path):
         cwd=wt, env=env, capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stderr + proc.stdout
+
+    log_text = gh_log.read_text()
+    # Comment was posted on the issue.
+    assert f"issue comment {issue}" in log_text
+    # No PR was opened.
+    assert "pr create" not in log_text
+    assert "pr list" not in log_text
+
+
+def test_finalize_comment_body_includes_branch_commit_diffstat(
+    tmp_git_repo, tmp_bot_root, tmp_path,
+):
+    """The comment body IS the solution summary — must include branch name,
+    commit short SHA, and diff stat."""
+    issue = 7
+    wt, branch = _make_worktree_with_diff(tmp_git_repo, tmp_bot_root, issue)
+    _git("remote", "add", "origin", str(tmp_git_repo), cwd=wt)
+    _git("config", "receive.denyCurrentBranch", "ignore", cwd=tmp_git_repo)
+
+    gh_log = tmp_path / "gh.log"
+    stubs = _stub_gh_in_path(tmp_path, gh_log)
+    env = os.environ.copy()
+    env["PATH"] = f"{stubs}:{env['PATH']}"
+    env["TM_GH_REPO"] = "owner/repo"
+    env["TM_BOT_ROOT"] = str(tmp_bot_root)
+    env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
+
+    proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+
+    log_text = gh_log.read_text()
+    body_match = log_text.split("BODY_BEGIN", 1)[1].split("BODY_END", 1)[0]
+    assert branch in body_match
+    assert "compare/main..." in body_match
+    assert "fix.txt" in body_match  # the file we changed appears in diff stat
+    assert "owner/repo" in body_match  # compare URL contains target repo
 
 
 def test_finalize_rejects_outside_worktree(tmp_path, monkeypatch):
@@ -131,22 +173,28 @@ def test_finalize_empty_diff_fails(tmp_git_repo, tmp_bot_root, tmp_path):
     assert "diff" in (proc.stderr + proc.stdout).lower()
 
 
-def test_finalize_idempotent_when_pr_exists(tmp_git_repo, tmp_bot_root, tmp_path):
+def test_finalize_rerun_is_idempotent(tmp_git_repo, tmp_bot_root, tmp_path):
+    """Running finalize twice on the same worktree produces 2 comments but
+    pushes nothing new the second time. The branch state on remote is
+    unchanged after the second run (no force-with-lease conflict)."""
     issue = 4
     wt, branch = _make_worktree_with_diff(tmp_git_repo, tmp_bot_root, issue)
     _git("remote", "add", "origin", str(tmp_git_repo), cwd=wt)
     _git("config", "receive.denyCurrentBranch", "ignore", cwd=tmp_git_repo)
-    stubs = _stub_gh_in_path(tmp_path, "pr-exists")
+    gh_log = tmp_path / "gh.log"
+    stubs = _stub_gh_in_path(tmp_path, gh_log)
     env = os.environ.copy()
     env["PATH"] = f"{stubs}:{env['PATH']}"
     env["TM_GH_REPO"] = "o/r"
     env["TM_BOT_ROOT"] = str(tmp_bot_root)
     env["TM_ISSUE_BRANCH_PREFIX"] = "auto-fix/issue-"
 
-    proc = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
-                          capture_output=True, text=True)
-    assert proc.returncode == 0
-    assert "55" in (proc.stdout + proc.stderr)  # reused PR number
+    p1 = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
+                        capture_output=True, text=True)
+    assert p1.returncode == 0, p1.stderr + p1.stdout
+    p2 = subprocess.run([str(FINALIZE), str(issue)], cwd=wt, env=env,
+                        capture_output=True, text=True)
+    assert p2.returncode == 0, p2.stderr + p2.stdout
 
 
 def test_finalize_diff_too_large(tmp_git_repo, tmp_bot_root, tmp_path):

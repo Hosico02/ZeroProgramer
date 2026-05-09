@@ -162,10 +162,46 @@ def cmd_tick(args) -> int:
             except Exception as e:
                 _log(bot_root, f"promote #{num} FAILED: {e}")
 
+    # Reap: cross-reference sub-PM's pm-state.json. Tasks tagged with
+    # source="github-issue:N" tell us whether the worker finished or PM gave up.
+    reaped_resolved = 0
+    reaped_failed = 0
+    pm_state_path = bot_root / "pm-state.json"
+    if pm_state_path.exists():
+        try:
+            pm_st = json.loads(pm_state_path.read_text())
+            for task in pm_st.get("tasks", []):
+                src = task.get("source") or ""
+                if not src.startswith("github-issue:"):
+                    continue
+                num = src.split(":", 1)[1]
+                rec = led.issues.get(num)
+                if rec is None or rec.status != "assigned":
+                    continue
+                if task.get("status") == "done":
+                    led.transition(num, "resolved", task_id=task.get("id"))
+                    reaped_resolved += 1
+                elif task.get("status") == "failed":
+                    led.transition(num, "failed", task_id=task.get("id"))
+                    reaped_failed += 1
+        except Exception as e:
+            _log(bot_root, f"reap pm-state failed: {e}")
+
+    # GC: drop terminal-state entries from state.json (user-requested — keep
+    # the file small so future ticks read less). Audit trail lives in PM's
+    # own state and in GitHub itself.
+    gc_count = 0
+    for num in [k for k, r in led.issues.items()
+                if r.status in ("resolved", "failed", "cancelled")]:
+        del led.issues[num]
+        gc_count += 1
+
     led.last_poll_ts = _now_iso()
     save_ledger(bot_root, led)
-    _log(bot_root, f"tick: promoted={promoted} cancelled={cancelled} "
-                   f"in_flight={led.count_in_flight()} daily={led.daily_spawn_count}")
+    _log(bot_root,
+         f"tick: promoted={promoted} cancelled={cancelled} "
+         f"reaped={reaped_resolved}/{reaped_failed} gc={gc_count} "
+         f"in_flight={led.count_in_flight()} daily={led.daily_spawn_count}")
     return 0
 
 

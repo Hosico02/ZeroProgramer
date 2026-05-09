@@ -12,7 +12,8 @@ set -euo pipefail
 # hooks would only get in the way.
 [ "${TM_AUTO:-0}" = "1" ] && exit 0
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="${TM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ROOT="$(cd "$ROOT" && pwd)"
 ROLE="${TM_ROLE:-executor}"
 
 # Read session_id from Claude's hook input JSON.
