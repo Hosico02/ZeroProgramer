@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# tm-issue-bot-resolve <issue-number>
+#
+# All-in-one issue resolver. Replaces the old "spawn a Claude window"
+# pattern. Single shot:
+#   1. fetch issue from gh CLI
+#   2. invoke `claude -p` headless with a tight system prompt + budget cap
+#   3. capture token / cost from JSON output
+#   4. commit whatever Claude edited (or call tm-issue-fail if no diff)
+#   5. call tm-issue-finalize with cost env vars so PR + issue comment
+#      include the spend report
+#
+# Runs in background fine — no terminal needed. Subscribe to its log:
+#   tail -f gh-issue-bot/resolve-<N>.log
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: tm-issue-bot-resolve <issue-number>" >&2
+  exit 64
+fi
+ISSUE="$1"
+
+[ -n "${TM_BOT_ROOT:-}" ] || { echo "TM_BOT_ROOT unset" >&2; exit 2; }
+
+# Self-contained: source the env file so we have TM_GH_REPO etc.
+if [ -f "$TM_BOT_ROOT/.gh-issue-bot.env" ]; then
+  set -a; . "$TM_BOT_ROOT/.gh-issue-bot.env"; set +a
+fi
+[ -n "${TM_GH_REPO:-}" ] || { echo "TM_GH_REPO unset" >&2; exit 2; }
+[ -n "${TM_ISSUE_BRANCH_PREFIX:-}" ] || TM_ISSUE_BRANCH_PREFIX="auto-fix/issue-"
+
+WT="$TM_BOT_ROOT/worktrees/issue-$ISSUE"
+[ -d "$WT" ] || { echo "no worktree: $WT" >&2; exit 1; }
+
+MODEL="${TM_FIXER_MODEL:-claude-haiku-4-5}"
+MAX_USD="${TM_FIXER_MAX_USD:-0.10}"
+
+# 1. Fetch issue title + body
+ISSUE_JSON=$(gh issue view "$ISSUE" --repo "$TM_GH_REPO" --json title,body 2>&1) || {
+  echo "gh issue view failed: $ISSUE_JSON" >&2; exit 5;
+}
+TITLE=$(printf '%s' "$ISSUE_JSON" | jq -r .title)
+BODY=$(printf '%s'  "$ISSUE_JSON" | jq -r .body)
+
+SYSTEM_PROMPT='You are gh-issue-bot.fixer, an unattended automatic issue fixer.
+
+You will receive ONE GitHub issue. Your job: make the SMALLEST file edits required to resolve it. Then stop.
+
+Strict rules (violating them wastes the user money — they are unhappy):
+- DO NOT explain. DO NOT chat. DO NOT write tests unless the issue explicitly asks.
+- DO NOT search the codebase broadly — the issue body should already point at specific files. If it does not, output exactly "CANNOT_RESOLVE: issue body too vague" and stop.
+- DO NOT git commit. The wrapper handles that.
+- DO NOT use Bash for anything beyond `git diff` / `git status` to verify your edit.
+- USE Read once per file, Edit once per file. No re-reads. No multi-pass refactors.
+- After your edit is applied, stop immediately. No summary, no farewell.
+
+Forbidden tools: WebSearch, WebFetch, Agent (subagent dispatch), Skills.
+
+You are paid by the token. Be miserly.'
+
+PROMPT_USER="$(cat <<EOF
+GitHub issue #${ISSUE} in repo ${TM_GH_REPO}.
+
+TITLE: ${TITLE}
+
+BODY:
+${BODY}
+
+WORKTREE (your cwd; you have full Read+Edit access here): ${WT}
+
+Resolve this issue with the minimum edit. Stop as soon as the file is saved.
+EOF
+)"
+
+# 2. Run claude -p, capture JSON
+T0=$(date +%s)
+cd "$WT"
+RESULT=$(claude -p \
+  --output-format json \
+  --model "$MODEL" \
+  --max-budget-usd "$MAX_USD" \
+  --system-prompt "$SYSTEM_PROMPT" \
+  --allowedTools "Read" "Edit" "Bash(git diff:*)" "Bash(git status:*)" \
+  --disallowedTools "WebSearch" "WebFetch" "Agent" "Skill" "Task" \
+  --disable-slash-commands \
+  --no-session-persistence \
+  --add-dir "$WT" \
+  --dangerously-skip-permissions \
+  "$PROMPT_USER" 2>&1) || {
+  echo "claude -p exited non-zero. tail of output:" >&2
+  echo "$RESULT" | tail -10 >&2
+  TM_FIXER_DURATION=$(( $(date +%s) - T0 )) \
+    "$TM_BOT_ROOT/bin/tm-issue-fail" "$ISSUE" "claude -p crashed or hit budget cap (\$${MAX_USD})"
+  exit 3
+}
+T1=$(date +%s)
+DURATION=$((T1 - T0))
+
+# 3. Parse result. claude -p with json should print a single JSON line.
+JSON=$(printf '%s' "$RESULT" | tail -1)
+IS_ERR=$(printf '%s' "$JSON" | jq -r '.is_error // false' 2>/dev/null || echo "true")
+RAW_RESULT=$(printf '%s' "$JSON" | jq -r '.result // ""' 2>/dev/null || echo "")
+COST_USD=$(printf '%s' "$JSON"   | jq -r '.total_cost_usd // 0' 2>/dev/null || echo "0")
+IN_TOK=$(printf '%s' "$JSON"     | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo "0")
+OUT_TOK=$(printf '%s' "$JSON"    | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo "0")
+CACHE_C=$(printf '%s' "$JSON"    | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo "0")
+CACHE_R=$(printf '%s' "$JSON"    | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo "0")
+TURNS=$(printf '%s' "$JSON"      | jq -r '.num_turns // 0' 2>/dev/null || echo "0")
+
+# Build the export block once — both fail and finalize paths use it
+COST_ENV=(
+  TM_FIXER_TOKENS_IN="$IN_TOK"
+  TM_FIXER_TOKENS_OUT="$OUT_TOK"
+  TM_FIXER_CACHE_C="$CACHE_C"
+  TM_FIXER_CACHE_R="$CACHE_R"
+  TM_FIXER_COST_USD="$COST_USD"
+  TM_FIXER_DURATION="$DURATION"
+  TM_FIXER_TURNS="$TURNS"
+  TM_FIXER_MODEL="$MODEL"
+)
+
+if [ "$IS_ERR" = "true" ]; then
+  REASON="claude -p reported error: $(printf '%s' "$RAW_RESULT" | head -c 300)"
+  env "${COST_ENV[@]}" "$TM_BOT_ROOT/bin/tm-issue-fail" "$ISSUE" "$REASON"
+  exit 3
+fi
+
+# Detect explicit "CANNOT_RESOLVE" sentinel from the model
+case "$RAW_RESULT" in
+  *CANNOT_RESOLVE*)
+    REASON="model declined: $(printf '%s' "$RAW_RESULT" | head -c 300)"
+    env "${COST_ENV[@]}" "$TM_BOT_ROOT/bin/tm-issue-fail" "$ISSUE" "$REASON"
+    exit 4
+    ;;
+esac
+
+# 4. Did claude actually edit something?
+if git -C "$WT" diff --quiet main && git -C "$WT" diff --cached --quiet main; then
+  REASON="claude -p produced no diff against main (model: $MODEL, cost: \$$COST_USD, ${IN_TOK}+${OUT_TOK} tokens, ${DURATION}s)"
+  env "${COST_ENV[@]}" "$TM_BOT_ROOT/bin/tm-issue-fail" "$ISSUE" "$REASON"
+  exit 4
+fi
+
+# 5. Commit (claude was told NOT to commit)
+git -C "$WT" -c user.email="bot@gh-issue-bot" -c user.name="gh-issue-bot" add -A
+git -C "$WT" -c user.email="bot@gh-issue-bot" -c user.name="gh-issue-bot" \
+  commit -m "issue #${ISSUE}: ${TITLE}
+
+Closes #${ISSUE}
+
+Resolved by gh-issue-bot · model ${MODEL} · ${IN_TOK}+${OUT_TOK} tokens · \$${COST_USD} · ${DURATION}s" \
+  >/dev/null
+
+# 6. Hand off to finalize for push + PR + comment, with cost env vars
+env "${COST_ENV[@]}" "$TM_BOT_ROOT/bin/tm-issue-finalize" "$ISSUE"

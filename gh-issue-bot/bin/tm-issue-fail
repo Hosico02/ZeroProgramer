@@ -15,6 +15,16 @@ REASON="$*"
 [ -n "${TM_GH_REPO:-}" ]         || { echo "TM_GH_REPO unset" >&2; exit 2; }
 LABEL="${TM_ISSUE_FAIL_LABEL:-auto-fix-failed}"
 
+# Optional cost report from the resolver
+COST_LINE=""
+if [ -n "${TM_FIXER_COST_USD:-}" ]; then
+  COST_LINE="
+
+### 本次尝试成本
+
+\`\$${TM_FIXER_COST_USD}\` · ${TM_FIXER_TOKENS_IN:-?}↑ + ${TM_FIXER_TOKENS_OUT:-?}↓ tokens · ${TM_FIXER_DURATION:-?}s · model \`${TM_FIXER_MODEL:-?}\`"
+fi
+
 BODY="$(cat <<EOF
 **🤖 gh-issue-bot 尝试自动解决此 issue 失败。**
 
@@ -34,7 +44,7 @@ ${REASON}
 2. **手动撤掉 \`${LABEL}\` 标签** —— 撤掉后 bot 下次 tick 会重试
 3. **手动关掉这个 issue** —— 如果你认为不该自动修
 
-> bot 不会自动重试带 \`${LABEL}\` 标签的 issue，避免反复烧 token。
+> bot 不会自动重试带 \`${LABEL}\` 标签的 issue，避免反复烧 token。${COST_LINE}
 EOF
 )"
 

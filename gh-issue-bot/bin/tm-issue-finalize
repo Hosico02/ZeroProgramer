@@ -75,6 +75,18 @@ COMMIT_SUBJECT="$(git log -1 --format=%s)"
 COMMIT_BODY="$(git log -1 --format=%b)"
 DIFF_STAT="$(git diff main --stat)"
 
+# Optional cost report (set by tm-issue-bot-resolve when calling us).
+COST_FOOTER=""
+COMMENT_COST_TAIL=""
+if [ -n "${TM_FIXER_COST_USD:-}" ]; then
+  COST_FOOTER="
+
+### 成本
+
+\`\$${TM_FIXER_COST_USD}\` · ${TM_FIXER_TOKENS_IN:-?}↑ + ${TM_FIXER_TOKENS_OUT:-?}↓ tokens (cache c/r: ${TM_FIXER_CACHE_C:-?}/${TM_FIXER_CACHE_R:-?}) · ${TM_FIXER_DURATION:-?}s · ${TM_FIXER_TURNS:-?} turns · model \`${TM_FIXER_MODEL:-?}\`"
+  COMMENT_COST_TAIL=" · 成本 \$${TM_FIXER_COST_USD} (${TM_FIXER_TOKENS_IN:-?}↑+${TM_FIXER_TOKENS_OUT:-?}↓ tokens, ${TM_FIXER_DURATION:-?}s)"
+fi
+
 PR_BODY="$(cat <<EOF
 Closes #${ISSUE}
 
@@ -94,7 +106,7 @@ ${DIFF_STAT}
 
 ### Commit
 
-\`${COMMIT_SHORT}\`
+\`${COMMIT_SHORT}\`${COST_FOOTER}
 
 ---
 _由 gh-issue-bot 在 worktree \`worktrees/issue-${ISSUE}/\` 内自动产出。bot 永不 auto-merge —— 由 owner 根据 issue 自行确认。_
@@ -113,6 +125,6 @@ fi
 
 # 8. Issue gets a short pointer; full solution lives in the PR body.
 gh issue comment "$ISSUE" --repo "$TM_GH_REPO" \
-  --body "🤖 已开 PR #${PR_NUM}（branch \`${HEAD_BRANCH}\`，commit \`${COMMIT_SHORT}\`），请 review 后决定是否 merge。完整修复说明见 PR 正文。" >/dev/null
+  --body "🤖 已开 PR #${PR_NUM}（branch \`${HEAD_BRANCH}\`，commit \`${COMMIT_SHORT}\`），请 review 后决定是否 merge。完整修复说明见 PR 正文。${COMMENT_COST_TAIL}" >/dev/null
 
-echo "ok pr=$PR_NUM branch=$HEAD_BRANCH commit=$COMMIT_SHORT"
+echo "ok pr=$PR_NUM branch=$HEAD_BRANCH commit=$COMMIT_SHORT cost=${TM_FIXER_COST_USD:-n/a} dur=${TM_FIXER_DURATION:-n/a}s"

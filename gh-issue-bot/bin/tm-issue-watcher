@@ -81,23 +81,34 @@ def _drop_add_task_event(bot_root: Path, *, title: str, signal_cmd: str,
 
 
 def _spawn_fixer(bot_root: Path, issue_num: str) -> str | None:
-    """Launch a new terminal running tm-claude-issue-fixer <N>. Returns 'spawned'
-    or None on failure. Honors TM_DRY_RUN=1 (logs only)."""
+    """Resolve the issue in the background via `claude -p` headless (no new
+    terminal window). The resolver script handles edit + commit + push + PR
+    + comment, including a cost report. Honors TM_DRY_RUN=1.
+
+    Returns 'resolving' (process started) or None on failure. The process
+    runs detached (start_new_session) so this watcher tick can return."""
     if os.environ.get("TM_DRY_RUN") == "1":
-        _log(bot_root, f"DRY: would spawn fixer for issue #{issue_num}")
+        _log(bot_root, f"DRY: would resolve issue #{issue_num}")
         return "dry"
-    repo_root = _repo_path()
-    spawn_helper = repo_root / "bin" / "_tm-spawn.sh"
-    fixer = bot_root / "bin" / "tm-claude-issue-fixer"
-    cmd = (
-        f". '{spawn_helper}' && "
-        f"tm_spawn_terminal_window '{bot_root}' '{fixer} {issue_num}'"
-    )
-    proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-    if proc.returncode != 0:
-        _log(bot_root, f"spawn failed for #{issue_num}: {proc.stderr.strip()}")
+    resolver = bot_root / "bin" / "tm-issue-bot-resolve"
+    if not resolver.exists():
+        _log(bot_root, f"resolver missing at {resolver}")
         return None
-    return "spawned"
+    log_path = bot_root / f"resolve-{issue_num}.log"
+    log_path.write_text(f"--- {_now_iso()} starting resolve #{issue_num} ---\n")
+    try:
+        with open(log_path, "ab") as logf:
+            subprocess.Popen(
+                [str(resolver), str(issue_num)],
+                stdout=logf, stderr=logf,
+                env={**os.environ, "TM_BOT_ROOT": str(bot_root)},
+                start_new_session=True,
+                cwd=str(bot_root),
+            )
+    except Exception as e:
+        _log(bot_root, f"resolver spawn failed for #{issue_num}: {e}")
+        return None
+    return "resolving"
 
 
 def _log(bot_root: Path, msg: str) -> None:
