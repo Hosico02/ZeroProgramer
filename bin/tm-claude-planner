@@ -1,15 +1,50 @@
 #!/usr/bin/env bash
-# Spawn an interactive Claude session in PLANNER role with auto-go +
-# real-time status in the terminal title bar.
+# tm-claude-planner — spawn an interactive Claude session in PLANNER role.
+#
+# Opt-in role: only used when tm-team-up --with-planner is passed. In
+# default 3-agent mode the supervisor handles planning duties. See
+# tm-claude-executor for the --permission-mode acceptEdits rationale.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TM_ROLE=planner "$ROOT/bin/tm-title-keeper" &
 keeper=$!
+trap 'kill "$keeper" 2>/dev/null || true' EXIT
 
 if [ $# -eq 0 ]; then
   set -- "go"
 fi
-env TM_ROLE=planner claude "$@"
-ec=$?
-kill "$keeper" 2>/dev/null
-exit "$ec"
+
+max_fails="${TM_RESPAWN_MAX:-5}"
+window_s="${TM_RESPAWN_WINDOW:-60}"
+fail_count=0
+window_start=0
+
+chosen_model="${TM_PLANNER_MODEL:-default}"
+model_args=()
+[ "$chosen_model" != "default" ] && model_args=(--model "$chosen_model")
+
+perm_mode="${TM_PERMISSION_MODE:-acceptEdits}"
+
+while true; do
+  env TM_ROLE=planner claude --permission-mode "$perm_mode" "${model_args[@]}" "$@"
+  ec=$?
+
+  if [ "$ec" -eq 0 ]; then
+    exit 0
+  fi
+
+  now=$(date +%s)
+  if [ $((now - window_start)) -gt "$window_s" ]; then
+    window_start=$now
+    fail_count=0
+  fi
+  fail_count=$((fail_count + 1))
+
+  if [ "$fail_count" -ge "$max_fails" ]; then
+    echo "tm-claude-planner: ${window_s}s 内连续失败 ${fail_count} 次 (last exit=$ec)，停止重启。" >&2
+    exit "$ec"
+  fi
+
+  echo "tm-claude-planner: claude exited (code=$ec); respawn ${fail_count}/${max_fails} in 5s …" >&2
+  sleep 5
+done

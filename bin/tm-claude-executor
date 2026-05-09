@@ -1,15 +1,68 @@
 #!/usr/bin/env bash
-# Spawn an interactive Claude session in default EXECUTOR role with auto-go +
-# real-time status in the terminal title bar.
+# tm-claude-executor — spawn an interactive Claude session in EXECUTOR role.
+#
+# Why --permission-mode acceptEdits:
+#   Default mode prompts on every file overwrite ("Do you want to overwrite
+#   main.py? 1.Yes 2.Yes-all 3.No"). With no human in the loop the executor
+#   stalls forever and PM eventually GCs it. acceptEdits auto-accepts file
+#   edits while still honoring the .claude/settings.json permissions list
+#   for Bash. For non-acceptable Bash commands, the allow-list does the
+#   gating (or a bypassPermissions toggle for sandboxes).
+#
+# Self-healing respawn:
+#   If `claude` exits non-zero (rate limit, OOM, transient API error) we
+#   restart automatically. If respawns happen faster than TM_RESPAWN_MAX
+#   (default 5) within TM_RESPAWN_WINDOW seconds (default 60) we give up —
+#   probably a persistent failure that retrying won't fix. Clean exit
+#   (code 0 / /exit) ends the loop normally.
+#
+# Model:
+#   Default Haiku 4.5 — executors do high-volume routine work where a
+#   cheap fast model is the right tradeoff. Override with TM_EXECUTOR_MODEL.
+#   TM_EXECUTOR_MODEL=default falls back to your global Claude Code default.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TM_ROLE=executor "$ROOT/bin/tm-title-keeper" &
 keeper=$!
+trap 'kill "$keeper" 2>/dev/null || true' EXIT
 
 if [ $# -eq 0 ]; then
   set -- "go"
 fi
-env TM_ROLE=executor claude "$@"
-ec=$?
-kill "$keeper" 2>/dev/null
-exit "$ec"
+
+max_fails="${TM_RESPAWN_MAX:-5}"
+window_s="${TM_RESPAWN_WINDOW:-60}"
+fail_count=0
+window_start=0
+
+chosen_model="${TM_EXECUTOR_MODEL:-claude-haiku-4-5-20251001}"
+model_args=()
+[ "$chosen_model" != "default" ] && model_args=(--model "$chosen_model")
+
+# Permission mode: acceptEdits is the right balance for autonomous workers.
+# Override with TM_PERMISSION_MODE=bypassPermissions for sandboxes.
+perm_mode="${TM_PERMISSION_MODE:-acceptEdits}"
+
+while true; do
+  env TM_ROLE=executor claude --permission-mode "$perm_mode" "${model_args[@]}" "$@"
+  ec=$?
+
+  if [ "$ec" -eq 0 ]; then
+    exit 0
+  fi
+
+  now=$(date +%s)
+  if [ $((now - window_start)) -gt "$window_s" ]; then
+    window_start=$now
+    fail_count=0
+  fi
+  fail_count=$((fail_count + 1))
+
+  if [ "$fail_count" -ge "$max_fails" ]; then
+    echo "tm-claude-executor: ${window_s}s 内连续失败 ${fail_count} 次 (last exit=$ec)，停止重启。" >&2
+    exit "$ec"
+  fi
+
+  echo "tm-claude-executor: claude exited (code=$ec); respawn ${fail_count}/${max_fails} in 5s …" >&2
+  sleep 5
+done
