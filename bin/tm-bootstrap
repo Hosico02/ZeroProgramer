@@ -117,11 +117,11 @@ def parse_args():
 
 
 def workspace_is_meaningful() -> bool:
-    """Return True if workspace/ has user content we shouldn't trample."""
+    """Return True if workspace/ has user content we shouldn't trample.
+    Empty placeholders dropped by tm-init are not "meaningful"."""
     if not WORKSPACE.exists():
         return False
-    # Allow a workspace that exists but contains only README.md or .gitkeep.
-    keep_ok = {"README.md", ".gitkeep", ".gitignore"}
+    keep_ok = {"README.md", ".gitkeep", ".gitignore", ".placeholder"}
     for p in WORKSPACE.iterdir():
         if p.is_file() and p.name in keep_ok:
             continue
@@ -129,10 +129,25 @@ def workspace_is_meaningful() -> bool:
     return False
 
 
+def is_tm_init_starter_plan(text: str) -> bool:
+    """The plan.md tm-init drops in is a known starter template; treat it
+    as 'no plan yet' so first-time bootstraps don't need --force."""
+    markers = (
+        "starter plan (replace with your own)",
+        "Verify the project's existing tests pass",
+    )
+    return any(m in text for m in markers)
+
+
 def existing_artifacts() -> list[str]:
     out = []
     if PLAN.exists():
-        out.append("plan.md")
+        try:
+            txt = PLAN.read_text()
+        except Exception:
+            txt = ""
+        if not is_tm_init_starter_plan(txt):
+            out.append("plan.md")
     if MANIFEST.exists():
         out.append("manifest.json")
     if workspace_is_meaningful():
