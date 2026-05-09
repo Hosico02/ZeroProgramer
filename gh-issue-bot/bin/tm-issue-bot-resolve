@@ -26,7 +26,14 @@ ISSUE="$1"
 if [ -f "$TM_BOT_ROOT/.gh-issue-bot.env" ]; then
   set -a; . "$TM_BOT_ROOT/.gh-issue-bot.env"; set +a
 fi
-[ -n "${TM_GH_REPO:-}" ] || { echo "TM_GH_REPO unset" >&2; exit 2; }
+# Fallback: derive TM_GH_REPO from the parent repo's `origin` remote.
+if [ -z "${TM_GH_REPO:-}" ]; then
+  PARENT_REPO="$(cd "$TM_BOT_ROOT/.." && pwd)"
+  TM_GH_REPO=$(git -C "$PARENT_REPO" remote get-url origin 2>/dev/null \
+               | sed -nE 's#.*github\.com[:/]([^/]+/[^/]+?)(\.git)?$#\1#p' | head -1)
+  export TM_GH_REPO
+fi
+[ -n "${TM_GH_REPO:-}" ] || { echo "TM_GH_REPO unset and could not derive from git remote origin" >&2; exit 2; }
 [ -n "${TM_ISSUE_BRANCH_PREFIX:-}" ] || TM_ISSUE_BRANCH_PREFIX="auto-fix/issue-"
 
 WT="$TM_BOT_ROOT/worktrees/issue-$ISSUE"
@@ -80,8 +87,8 @@ RESULT=$(claude -p \
   --model "$MODEL" \
   --max-budget-usd "$MAX_USD" \
   --system-prompt "$SYSTEM_PROMPT" \
-  --allowedTools "Read" "Edit" "Bash(git diff:*)" "Bash(git status:*)" \
-  --disallowedTools "WebSearch" "WebFetch" "Agent" "Skill" "Task" \
+  --allowedTools "Read Edit Bash(git diff:*) Bash(git status:*)" \
+  --disallowedTools "WebSearch WebFetch Agent Skill Task" \
   --disable-slash-commands \
   --no-session-persistence \
   --add-dir "$WT" \
