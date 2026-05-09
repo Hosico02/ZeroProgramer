@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# tm-issue-bot — top-level CLI for the gh-issue-bot sub-project.
+set -euo pipefail
+
+BOT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$BOT_ROOT/.." && pwd)"
+WATCHER="$BOT_ROOT/bin/tm-issue-watcher"
+PMSTART="$BOT_ROOT/bin/tm-issue-bot-pm-start"
+LOG="$BOT_ROOT/watcher.log"
+PIDFILE="$BOT_ROOT/pm.pid"
+WATCHDOG_PIDFILE="$BOT_ROOT/pm-watchdog.pid"
+WATCHDOG_LOG="$BOT_ROOT/pm-watchdog.log"
+
+# Read poll interval from .env (default 600)
+INTERVAL=600
+if [ -f "$BOT_ROOT/.gh-issue-bot.env" ]; then
+  v=$(awk -F= '/^TM_ISSUE_POLL_INTERVAL=/ {print $2; exit}' "$BOT_ROOT/.gh-issue-bot.env" || true)
+  [ -n "${v:-}" ] && INTERVAL="$v"
+fi
+
+is_pm_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+is_wd_running() { [ -f "$WATCHDOG_PIDFILE" ] && kill -0 "$(cat "$WATCHDOG_PIDFILE")" 2>/dev/null; }
+
+cmd_install() {
+  echo "── installing gh-issue-bot ──"
+  # 1. ensure config exists
+  if [ ! -f "$BOT_ROOT/.gh-issue-bot.env" ]; then
+    cp "$BOT_ROOT/.gh-issue-bot.env.example" "$BOT_ROOT/.gh-issue-bot.env"
+    echo "  wrote default $BOT_ROOT/.gh-issue-bot.env (review it!)"
+  fi
+  # 2. start sub-PM (background)
+  "$PMSTART" --background
+  # 3. start watchdog (uses tm-pm watchdog --forever scoped to BOT_ROOT)
+  if ! is_wd_running; then
+    : > "$WATCHDOG_LOG"
+    TM_ROOT="$BOT_ROOT" nohup "$REPO_ROOT/bin/tm-pm" watchdog --forever \
+      >> "$WATCHDOG_LOG" 2>&1 &
+    sleep 0.4
+  fi
+  # 4. install scheduler
+  python3 - "$BOT_ROOT" "$WATCHER" "$LOG" "$INTERVAL" <<'PY'
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).resolve()))
+from lib.scheduler import (
+    detect_platform,
+    macos_install, systemd_install, cron_install,
+)
+plat = detect_platform()
+if plat == "macos":
+    macos_install(watcher=sys.argv[2], log=sys.argv[3], interval=int(sys.argv[4]))
+elif plat == "linux-systemd":
+    systemd_install(watcher=sys.argv[2], interval=int(sys.argv[4]))
+elif plat == "linux-cron":
+    cron_install(watcher=sys.argv[2], log=sys.argv[3], interval=int(sys.argv[4]))
+else:
+    print(f"unsupported platform: {plat}", file=sys.stderr); sys.exit(1)
+print(f"  scheduler installed: {plat}")
+PY
+  # 5. validation tick (dry-run)
+  echo "── validation tick (dry-run) ──"
+  TM_BOT_ROOT="$BOT_ROOT" TM_DRY_RUN=1 "$WATCHER" tick || {
+    echo "✗ validation tick failed; rolling back" >&2
+    cmd_uninstall
+    exit 1
+  }
+  echo "✓ install complete"
+  cmd_status
+}
+
+cmd_uninstall() {
+  echo "── uninstalling gh-issue-bot ──"
+  python3 - "$BOT_ROOT" <<'PY'
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).resolve()))
+from lib.scheduler import detect_platform, macos_uninstall, systemd_uninstall, cron_uninstall
+plat = detect_platform()
+if plat == "macos":         macos_uninstall()
+elif plat == "linux-systemd": systemd_uninstall()
+elif plat == "linux-cron":    cron_uninstall()
+PY
+  # stop watchdog before PM (so PM stays down)
+  if is_wd_running; then kill "$(cat "$WATCHDOG_PIDFILE")" 2>/dev/null || true; fi
+  rm -f "$WATCHDOG_PIDFILE"
+  if is_pm_running; then
+    TM_ROOT="$BOT_ROOT" "$REPO_ROOT/bin/tm-pm" shutdown "uninstall" || true
+    sleep 1
+    is_pm_running && kill "$(cat "$PIDFILE")" 2>/dev/null || true
+  fi
+  rm -f "$PIDFILE"
+  echo "✓ scheduler removed; sub-PM stopped"
+  printf "Remove worktrees and state.json? [y/N] "
+  read -r ans || ans=""
+  case "$ans" in
+    y|Y|yes|YES)
+      rm -rf "$BOT_ROOT/worktrees"/* "$BOT_ROOT/state.json" "$BOT_ROOT/pm-state.json"
+      rm -rf "$BOT_ROOT/events"/* "$BOT_ROOT/tasks"/* "$BOT_ROOT/escalations"/*
+      echo "  ✓ purged" ;;
+    *) echo "  (kept worktrees/ and state.json)" ;;
+  esac
+}
+
+cmd_status() {
+  echo "── gh-issue-bot status ──"
+  echo -n "  scheduler: "
+  python3 - "$BOT_ROOT" <<'PY'
+import sys, pathlib, subprocess
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).resolve()))
+from lib.scheduler import detect_platform, MACOS_LABEL
+plat = detect_platform()
+if plat == "macos":
+    p = subprocess.run(["launchctl", "list", MACOS_LABEL], capture_output=True)
+    print("running" if p.returncode == 0 else "not loaded")
+elif plat == "linux-systemd":
+    p = subprocess.run(["systemctl", "--user", "is-active", "gh-issue-bot.timer"],
+                       capture_output=True, text=True)
+    print(p.stdout.strip() or "unknown")
+elif plat == "linux-cron":
+    p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    print("installed" if "gh-issue-bot" in p.stdout else "not installed")
+else:
+    print(f"unsupported platform {plat}")
+PY
+  if is_pm_running; then echo "  sub-PM:  running (pid $(cat "$PIDFILE"))"
+  else echo "  sub-PM:  not running"; fi
+  if is_wd_running; then echo "  watchdog: running (pid $(cat "$WATCHDOG_PIDFILE"))"
+  else echo "  watchdog: not running"; fi
+  TM_BOT_ROOT="$BOT_ROOT" "$WATCHER" status
+}
+
+cmd_tick()  { TM_BOT_ROOT="$BOT_ROOT" "$WATCHER" tick; }
+cmd_doctor(){ TM_BOT_ROOT="$BOT_ROOT" "$WATCHER" doctor; }
+cmd_start() { "$PMSTART" --background; }
+cmd_stop()  {
+  if is_pm_running; then
+    TM_ROOT="$BOT_ROOT" "$REPO_ROOT/bin/tm-pm" shutdown "stop" || true
+  fi
+}
+cmd_logs()  {
+  n="${1:-50}"
+  echo "── watcher.log (last $n) ──"; tail -n "$n" "$LOG" 2>/dev/null || true
+  echo "── pm.log (last $n) ──";      tail -n "$n" "$BOT_ROOT/pm.log" 2>/dev/null || true
+}
+
+case "${1:-help}" in
+  install)   shift; cmd_install ;;
+  uninstall) shift; cmd_uninstall ;;
+  status)    cmd_status ;;
+  tick)      cmd_tick ;;
+  doctor)    cmd_doctor ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  logs)      shift; cmd_logs "${1:-50}" ;;
+  help|-h|--help)
+    cat <<EOF
+tm-issue-bot — gh-issue-bot CLI
+
+Subcommands:
+  install      detect platform → install scheduler + start sub-PM + watchdog + validation tick
+  uninstall    remove scheduler + stop sub-PM/watchdog (asks before purging state)
+  status       scheduler / sub-PM / watchdog / in-flight issues
+  tick         run one watcher tick now (debug)
+  doctor       sanity-check tools + config
+  start        start sub-PM only (no scheduler)
+  stop         stop sub-PM
+  logs [N]     tail watcher.log + pm.log
+EOF
+    ;;
+  *) echo "unknown subcommand: $1" >&2; exit 1 ;;
+esac
