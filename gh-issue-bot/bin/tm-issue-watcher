@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""tm-issue-watcher — the 10-min poller for gh-issue-bot.
+
+Subcommands:
+  tick     run one poll/diff/spawn/reap cycle
+  status   summarize scheduler / sub-PM / in-flight issues to stdout
+  doctor   sanity-check config and external tools (gh, git)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# Ensure lib/ on path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from lib.config import load_config
+from lib.gh import list_issues, GhError
+from lib.state import load_ledger, save_ledger
+from lib.watcher_logic import plan_actions
+
+WATCHER_LOG_NAME = "watcher.log"
+
+
+def _today_utc() -> str:
+    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _bot_root() -> Path:
+    p = os.environ.get("TM_BOT_ROOT")
+    if p:
+        return Path(p).resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+def _repo_path() -> Path:
+    """Path to the *target* git repo (whose remote we push to)."""
+    p = os.environ.get("TM_REPO_PATH")
+    if p:
+        return Path(p).resolve()
+    # Default: the parent of bot_root (the ZeroProgramer repo itself).
+    return _bot_root().parent
+
+
+def _disabled(bot_root: Path) -> bool:
+    return (bot_root / ".disabled").exists()
+
+
+def _create_worktree(repo: Path, wt_dir: Path, branch: str) -> None:
+    wt_dir.parent.mkdir(parents=True, exist_ok=True)
+    if wt_dir.exists():
+        return  # already created (resume after crash)
+    subprocess.run(["git", "worktree", "add", "-b", branch, str(wt_dir), "main"],
+                   cwd=repo, check=True, capture_output=True)
+
+
+def _drop_add_task_event(bot_root: Path, *, title: str, signal_cmd: str,
+                         source: str) -> None:
+    events_dir = bot_root / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    micro = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1_000_000)
+    payload = {
+        "ts": _now_iso(),
+        "type": "add_task",
+        "session_id": "watcher",
+        "data": {"title": title, "signal_cmd": signal_cmd, "source": source},
+    }
+    p = events_dir / f"{micro}_add_task_{source.replace(':','_')}.json"
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, p)
+
+
+def _spawn_fixer(bot_root: Path, issue_num: str) -> str | None:
+    """Launch a new terminal running tm-claude-issue-fixer <N>. Returns 'spawned'
+    or None on failure. Honors TM_DRY_RUN=1 (logs only)."""
+    if os.environ.get("TM_DRY_RUN") == "1":
+        _log(bot_root, f"DRY: would spawn fixer for issue #{issue_num}")
+        return "dry"
+    repo_root = _repo_path()
+    spawn_helper = repo_root / "bin" / "_tm-spawn.sh"
+    fixer = bot_root / "bin" / "tm-claude-issue-fixer"
+    cmd = (
+        f". '{spawn_helper}' && "
+        f"tm_spawn_terminal_window '{bot_root}' '{fixer} {issue_num}'"
+    )
+    proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+    if proc.returncode != 0:
+        _log(bot_root, f"spawn failed for #{issue_num}: {proc.stderr.strip()}")
+        return None
+    return "spawned"
+
+
+def _log(bot_root: Path, msg: str) -> None:
+    p = bot_root / WATCHER_LOG_NAME
+    with p.open("a") as f:
+        f.write(f"[{_now_iso()}] {msg}\n")
+
+
+# ── Subcommands ────────────────────────────────────────────────────────────
+
+def cmd_tick(args) -> int:
+    bot_root = _bot_root()
+    if _disabled(bot_root):
+        _log(bot_root, "tick: .disabled present; skipping")
+        return 0
+    cfg = load_config(bot_root)
+    led = load_ledger(bot_root)
+
+    try:
+        issues = list_issues(cfg.repo, label=cfg.label)
+    except GhError as e:
+        _log(bot_root, f"gh issue list FAILED: {e}")
+        return 1
+
+    today = _today_utc()
+    actions = plan_actions(issues, led, cfg, today=today)
+
+    promoted = 0
+    cancelled = 0
+    for a in actions:
+        if a["op"] == "upsert_seen":
+            led.upsert_seen(a["number"], title=a["title"],
+                            labels=a["labels"], updated_at=a["updated_at"])
+        elif a["op"] == "cancel":
+            led.transition(a["number"], "cancelled")
+            cancelled += 1
+        elif a["op"] == "promote":
+            num = a["number"]
+            branch = f"{cfg.branch_prefix}{num}"
+            wt = bot_root / "worktrees" / f"issue-{num}"
+            try:
+                if os.environ.get("TM_DRY_RUN") != "1":
+                    _create_worktree(_repo_path(), wt, branch)
+                title = (
+                    f"[issue #{num}] {a['title']}\n\nBody:\n{a['body']}\n\n"
+                    f"WORKTREE: {wt}\nISSUE: {num}\n\n"
+                    f"Edit code in WORKTREE to resolve the issue, then run tm-done."
+                )
+                signal_cmd = f"{bot_root / 'bin' / 'tm-issue-finalize'} {num}"
+                if os.environ.get("TM_DRY_RUN") != "1":
+                    _drop_add_task_event(
+                        bot_root, title=title, signal_cmd=signal_cmd,
+                        source=f"github-issue:{num}",
+                    )
+                if os.environ.get("TM_DRY_RUN") != "1":
+                    led.transition(num, "assigned",
+                                   worktree=str(wt), branch=branch,
+                                   attempts=led.issues[num].attempts + 1)
+                    led.note_spawn(today=today)
+                    _spawn_fixer(bot_root, num)
+                promoted += 1
+            except Exception as e:
+                _log(bot_root, f"promote #{num} FAILED: {e}")
+
+    led.last_poll_ts = _now_iso()
+    save_ledger(bot_root, led)
+    _log(bot_root, f"tick: promoted={promoted} cancelled={cancelled} "
+                   f"in_flight={led.count_in_flight()} daily={led.daily_spawn_count}")
+    return 0
+
+
+def cmd_status(args) -> int:
+    bot_root = _bot_root()
+    led = load_ledger(bot_root)
+    print(f"gh-issue-bot @ {bot_root}")
+    print(f"  last_poll: {led.last_poll_ts or 'never'}")
+    print(f"  daily spawns: {led.daily_spawn_count} (date {led.daily_spawn_date})")
+    in_flight = [(n, r) for n, r in led.issues.items() if r.status == "assigned"]
+    print(f"  in-flight ({len(in_flight)}):")
+    for num, rec in in_flight:
+        print(f"    #{num} {rec.title[:60]} attempts={rec.attempts} branch={rec.branch}")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    bot_root = _bot_root()
+    ok = True
+    for tool in ("gh", "git"):
+        proc = subprocess.run(["which", tool], capture_output=True, text=True)
+        print(f"  {tool}: {proc.stdout.strip() or 'NOT FOUND'}")
+        if proc.returncode != 0: ok = False
+    try:
+        cfg = load_config(bot_root)
+        print(f"  config: repo={cfg.repo} label={cfg.label} max_parallel={cfg.max_parallel}")
+    except Exception as e:
+        print(f"  config: FAIL {e}")
+        ok = False
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="tm-issue-watcher")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("tick").set_defaults(func=cmd_tick)
+    sub.add_parser("status").set_defaults(func=cmd_status)
+    sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

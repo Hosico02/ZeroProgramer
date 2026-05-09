@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Launch a Claude Code session inside the per-issue worktree.
+# Args: <issue-number>
+#
+# Called from tm-issue-watcher via _tm-spawn.sh; the watcher has already
+# created the worktree and dropped the add_task event for this issue. The
+# session here just registers as a sub-PM worker, gets the task, and works.
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: tm-claude-issue-fixer <issue-number>" >&2
+  exit 64
+fi
+ISSUE="$1"
+
+BOT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$BOT_ROOT/.." && pwd)"
+WORKTREE="$BOT_ROOT/worktrees/issue-$ISSUE"
+
+if [ ! -d "$WORKTREE" ]; then
+  echo "worktree missing: $WORKTREE — watcher should have created it" >&2
+  exit 65
+fi
+
+cd "$WORKTREE"
+export TM_ROOT="$BOT_ROOT"            # tm-done writes events to sub-PM
+export TM_ISSUE_NUMBER="$ISSUE"       # available to the session for the prompt
+export TM_PROJECT_NAME="issue-$ISSUE"  # statusline label
+
+# Auto-submit "go" so the session begins immediately, mirroring tm-team-up.
+# Pre-flight by piping into claude's tty stdin; harmless if claude doesn't read it.
+exec claude --dangerously-skip-permissions <<<"go"

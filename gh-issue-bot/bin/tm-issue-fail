@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# tm-issue-fail <issue#> "<reason>"
+#
+# Posts a "auto-fix-failed: <reason>" comment on the issue and adds the
+# fail label. Used by tm-issue-watcher when an attempt is permanently lost.
+set -euo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: tm-issue-fail <issue#> <reason>" >&2
+  exit 64
+fi
+ISSUE="$1"; shift
+REASON="$*"
+
+[ -n "${TM_GH_REPO:-}" ]         || { echo "TM_GH_REPO unset" >&2; exit 2; }
+LABEL="${TM_ISSUE_FAIL_LABEL:-auto-fix-failed}"
+
+BODY="$(printf 'auto-fix-failed: %s\n\n(gh-issue-bot will not retry this issue until the `%s` label is removed.)\n' "$REASON" "$LABEL")"
+
+gh issue comment "$ISSUE" --repo "$TM_GH_REPO" --body "$BODY" >/dev/null
+gh issue edit    "$ISSUE" --repo "$TM_GH_REPO" --add-label "$LABEL" >/dev/null
+echo "ok labelled=$LABEL"

@@ -1,0 +1,20 @@
+# State managed by the running system (not source-controlled)
+pm-state.json
+pm.log
+pm.pid
+pm-watchdog.log
+pm-watchdog.pid
+events/
+tasks/
+nags/
+escalations/
+worktrees/
+state.json
+watcher.log
+.gh-issue-bot.env
+.disabled
+.last-progress-*
+.session-id
+
+# Re-include processed-marker dir so the events/ pipeline boots clean on first run
+!events/.processed/

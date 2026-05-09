@@ -11,7 +11,8 @@
 #                 polling (the auto-loop itself drives the next task).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="${TM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ROOT="$(cd "$ROOT" && pwd)"
 # Prefer CLAUDE_CODE_SESSION_ID (per-window, set by Claude Code in the agent's
 # tool-execution env). Falls back to the legacy .session-id only for
 # single-window setups; multi-window operation MUST use the env var because
