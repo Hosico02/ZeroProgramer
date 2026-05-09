@@ -79,9 +79,23 @@ Resolve this issue with the minimum edit. Stop as soon as the file is saved.
 EOF
 )"
 
-# 2. Run claude -p, capture JSON
-T0=$(date +%s)
+# 2. Sync worktree to current origin/main as branch base. Without this,
+# if local main moved between worktree creation and resolve time, the PR's
+# diff will include inverse-of-those-commits as if the branch is reverting
+# them. Reset on first run is fine; on a re-run for the same issue we just
+# overwrite the prior local attempt (the prior commit on the branch is
+# discarded — the resolver always produces a single, current-base commit).
 cd "$WT"
+git fetch origin main >/dev/null 2>&1 || true
+if git rev-parse --verify origin/main >/dev/null 2>&1; then
+  git checkout -B "${TM_ISSUE_BRANCH_PREFIX}${ISSUE}" origin/main >/dev/null 2>&1 || {
+    echo "failed to reset $WT branch onto origin/main" >&2
+    exit 6
+  }
+fi
+
+# 3. Run claude -p, capture JSON
+T0=$(date +%s)
 RESULT=$(claude -p \
   --output-format json \
   --model "$MODEL" \
