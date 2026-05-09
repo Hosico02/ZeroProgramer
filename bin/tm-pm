@@ -3,7 +3,8 @@
 # Usage: tm-pm {start|stop|status|log [N]|reset|tail|gc|escalations|shutdown [reason]|watch [interval]}
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="${TM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ROOT="$(cd "$ROOT" && pwd)"   # canonicalize even if TM_ROOT was relative
 PIDFILE="$ROOT/pm.pid"
 LOG="$ROOT/pm.log"
 DAEMON="$ROOT/bin/pm-daemon.py"
