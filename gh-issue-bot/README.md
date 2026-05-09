@@ -47,3 +47,20 @@ repo per install; multi-repo support is intentionally not provided.
 ## Architecture
 
 See `docs/superpowers/specs/2026-05-09-gh-issue-bot-design.md` for the design.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `tm-issue-bot status` shows "scheduler: not loaded" on macOS | LaunchAgent path doesn't exist or has bad XML | `tm-issue-bot uninstall` then `install`. Check with `launchctl list | grep gh-issue-bot`. |
+| `gh issue list FAILED: gh auth status …` in `watcher.log` | gh CLI not authenticated | `gh auth login`. |
+| sub-PM keeps respawning, fixer windows never appear | `_tm-spawn.sh` can't find a terminal backend | Run `bash -x` on the watcher; if on Linux/headless, set `TM_TERMINAL=tmux`. |
+| Issue stuck in `assigned` for hours | Fixer session crashed without reporting | `tm-issue-bot tick` (next tick respawns up to 3 times). |
+| Want to pause without uninstalling | — | `touch gh-issue-bot/.disabled`. Resume with `rm gh-issue-bot/.disabled`. |
+| Want to retry an already-failed issue | The `auto-fix-failed` label blocks re-entry | Remove the label on GitHub. |
+
+## Logs
+
+- `gh-issue-bot/watcher.log` — every tick prints one summary line.
+- `gh-issue-bot/pm.log` — sub-PM's task assignments / signal_cmd retries / escalations.
+- `gh-issue-bot/pm-watchdog.log` — sub-PM watchdog crashes/restarts.

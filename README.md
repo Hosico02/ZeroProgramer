@@ -323,6 +323,14 @@ bin/
 └── tm-{plan,review,assess,goal-review,profile}    # one-shot claude -p tools
 ```
 
+### `gh-issue-bot/` (optional)
+
+A standalone sub-project that watches a configured GitHub repo for issues
+labelled `auto-fix` and resolves them autonomously by spawning a Claude
+session per issue inside an isolated git worktree, then opening a PR with
+`Closes #N`. Install with `gh-issue-bot/bin/tm-issue-bot install`. See
+`gh-issue-bot/README.md` and `docs/superpowers/specs/2026-05-09-gh-issue-bot-design.md`.
+
 ---
 
 ## Documentation
