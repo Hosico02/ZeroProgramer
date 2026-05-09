@@ -103,16 +103,56 @@ $EDITOR goal.md                       # describe what 'done' looks like
 cp -r ~/source/* workspace/           # populate workspace with code to be managed
 
 # 4. launch
-./bin/tm-team-up 2
+./bin/tm-pm-up                        # PM + browser, click ▶ 启动 in dashboard
+# or:  ./bin/tm-team-up 2             # one-shot, agents start immediately
 ```
 
 `tm-init` creates:
 - `bin/` — the toolkit
-- `.claude/settings.json` — hooks + permissions + statusLine
+- `.claude/settings.json` — hooks + permissions
 - `CLAUDE.md` — executor instructions
 - `goal.md` and `vision.md` templates
 - `workspace/` — the only directory executors can edit
 - `.gitignore` — runtime state stays out of git
+
+### Option C: 0 → 1 from a goal.md alone (greenfield projects)
+
+The agent team is a **gap-filler** — it audits `workspace/` for missing
+work and queues tasks. With an empty workspace there's nothing to audit,
+so the loop never starts. `tm-bootstrap` bridges the gap with a single
+`claude -p` call that turns `goal.md` into an initial plan + scaffold:
+
+```bash
+# 1. setup as Option B steps 1–2
+cd ~/my-doudizhu
+
+# 2. write goal.md (a paragraph or two is enough)
+cat > goal.md <<'EOF'
+做一个多 Agent 斗地主的 HTTP 小游戏，使用 Python。
+- 三个 AI agent 轮流出牌
+- 一个简单的 web 前端展示牌局
+- 后端用 FastAPI + WebSocket 推送状态
+EOF
+
+# 3. bootstrap — generates plan.md + manifest.json + workspace/ scaffold
+./bin/tm-bootstrap                    # ≈ $0.05–$0.20, 30–60s
+./bin/tm-bootstrap --dry-run          # preview without writing
+./bin/tm-bootstrap --force            # overwrite if you've run it before
+
+# 4. review what it produced, then launch
+$EDITOR plan.md                       # tweak ordering / wording if needed
+./bin/tm-pm-up                        # click ▶ 启动 in the browser
+```
+
+`tm-bootstrap` outputs:
+- `plan.md` — 8–12 ordered tasks (with `signal_cmd`s where verifiable)
+- `manifest.json` — 4–6 audit dimensions tailored to THIS project
+- `workspace/<scaffold>` — directory tree + minimal placeholder files
+  (empty class shells, requirements.txt, basic README) so the first
+  executor task has imports to satisfy
+
+After this the agent team has cracks to fill, and the normal 0→done
+loop takes over.
 
 ---
 
@@ -462,6 +502,7 @@ bin/
 ├── tm-pm                     # PM control (start/stop/status/watch/...)
 ├── tm-pm-up                  # PM + helpers + browser, NO agents (dashboard-driven flow)
 ├── tm-team-up                # one-shot: PM + helpers + agents (start everything immediately)
+├── tm-bootstrap              # one-shot 0→1: goal.md → plan.md + workspace scaffold
 ├── tm-init                   # install framework into target dir
 ├── tm-claude-supervisor      # spawn supervisor window
 ├── tm-claude-planner         # spawn planner window (opt-in, 4-agent mode only)

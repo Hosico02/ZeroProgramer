@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""tm-bootstrap — turn a goal.md into a runnable plan.
+
+The agent team is a gap-filler: it audits existing code via tm-profile and
+keeps the queue full. With an empty workspace/ there's no code to audit,
+so the loop never starts. This script bridges 0→1: one `claude -p` call
+reads goal.md and emits
+
+  - plan.md           initial 8-12 ordered tasks (with signal_cmd where useful)
+  - manifest.json     audit dimensions tailored to THIS project
+  - workspace/<scaffold>  directory tree + minimal placeholder files
+
+After running this, the agent team has something to chew on:
+
+  ./bin/tm-bootstrap              # one-shot generation
+  ./bin/tm-pm-up                  # then launch dashboard, click ▶ 启动
+
+Flags:
+  --force          overwrite existing plan.md / manifest.json / workspace/
+  --model <id>     override claude model (default: env TM_MODEL_CREATIVE,
+                   else claude default)
+  --dry-run        print the proposed scaffold without writing files
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+GOAL = ROOT / "goal.md"
+WORKSPACE = ROOT / "workspace"
+PLAN = ROOT / "plan.md"
+MANIFEST = ROOT / "manifest.json"
+
+
+PROMPT_TEMPLATE = """\
+You are bootstrapping a brand-new software project. The user has only
+written a brief goal.md and an autonomous agent team is about to take
+over. Your job: design just enough scaffold that gap-filling agents have
+real cracks to fill.
+
+# PROJECT
+name: {project}
+
+# GOAL (from goal.md)
+{goal}
+
+# YOUR OUTPUT
+Return ONE JSON object with EXACTLY these fields. Pure JSON, no prose,
+no markdown fences. Use double quotes throughout.
+
+{{
+  "summary": "one short paragraph describing what you'll build and why",
+  "stack": ["lang+version", "frameworks", "key libs"],
+  "directory_structure": {{
+    "workspace/relative/path/": "one-line purpose"
+  }},
+  "placeholder_files": {{
+    "workspace/relative/path/file.ext": "starter content — keep small, ≤30 lines, just enough to compile/import"
+  }},
+  "tasks": [
+    {{
+      "title": "actionable one-line — agent should know exactly what to do",
+      "signal_cmd": "shell command that exits 0 when done (or null)",
+      "depends_on": [<list of 1-based task ids>]
+    }}
+  ],
+  "manifest_dimensions": [
+    {{"name": "correctness", "weight": 1.0, "rationale": "why this dimension matters here"}}
+  ]
+}}
+
+# CONSTRAINTS
+- ALL paths in directory_structure / placeholder_files MUST start with `workspace/`.
+- Generate 8–12 tasks, ordered: scaffold/skeleton first, then core domain logic,
+  then integration, then test coverage. The first task must produce something
+  importable / runnable.
+- Each task is ~1–2 hours of focused work; not a whole module.
+- Where possible, set signal_cmd to a real verification (pytest, ruff, curl
+  against a started server, etc.). Use null if signal can't be automated.
+- depends_on can be empty `[]` for the first task; later tasks should
+  reference earlier ones by 1-based id.
+- placeholder_files: keep tiny — one Python file with empty class shells,
+  a requirements.txt, a basic README. The agents will flesh them out.
+- manifest_dimensions: 4–6 entries. Pick dimensions that actually apply
+  (e.g. game-rule-correctness for a card game, network-latency for a
+  realtime API). Skip generic dimensions that don't fit.
+- DO NOT include a top-level `__init__.py` outside workspace/. DO NOT
+  reference paths outside workspace/ except for the manifest.
+
+# STYLE
+- Concise tasks. "Implement Card class with rank/suit + comparison" not
+  "Create a thoughtful Card class that captures the essence of …".
+- No filler files. Empty `__init__.py` is fine where Python needs it.
+- Prefer relative imports inside workspace/.
+"""
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Bootstrap an initial scaffold + plan from goal.md",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--force", action="store_true",
+                   help="overwrite existing plan.md / manifest.json / workspace/ contents")
+    p.add_argument("--model", default=os.environ.get("TM_MODEL_CREATIVE"),
+                   help="override claude model (default: env TM_MODEL_CREATIVE)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the proposed scaffold without writing files")
+    return p.parse_args()
+
+
+def workspace_is_meaningful() -> bool:
+    """Return True if workspace/ has user content we shouldn't trample."""
+    if not WORKSPACE.exists():
+        return False
+    # Allow a workspace that exists but contains only README.md or .gitkeep.
+    keep_ok = {"README.md", ".gitkeep", ".gitignore"}
+    for p in WORKSPACE.iterdir():
+        if p.is_file() and p.name in keep_ok:
+            continue
+        return True
+    return False
+
+
+def existing_artifacts() -> list[str]:
+    out = []
+    if PLAN.exists():
+        out.append("plan.md")
+    if MANIFEST.exists():
+        out.append("manifest.json")
+    if workspace_is_meaningful():
+        out.append("workspace/ (non-empty)")
+    return out
+
+
+def call_claude(prompt: str, model: str | None) -> str:
+    cmd = ["claude", "-p", prompt, "--no-session-persistence"]
+    if model:
+        cmd[2:2] = ["--model", model]
+    print(f"▸ calling claude (this takes 30–60s; cost ≈ $0.05–$0.20) …",
+          file=sys.stderr, flush=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if res.returncode != 0:
+        sys.stderr.write(f"claude exited {res.returncode}\n")
+        sys.stderr.write((res.stderr or res.stdout)[:1500] + "\n")
+        sys.exit(3)
+    return res.stdout
+
+
+def extract_json(text: str) -> dict:
+    """Claude usually returns clean JSON, but sometimes adds a ```json fence
+    or trailing prose. Strip fences first; if that fails, find the first
+    balanced `{...}` block."""
+    s = text.strip()
+    s = re.sub(r"^```(?:json)?\s*\n", "", s)
+    s = re.sub(r"\n```\s*$", "", s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # Fallback: greedy first-{-to-last-} (works when prose precedes/follows)
+    start = s.find("{")
+    end = s.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(s[start : end + 1])
+        except json.JSONDecodeError as e:
+            sys.stderr.write("claude returned non-JSON output:\n")
+            sys.stderr.write(text[:1500] + "\n")
+            sys.stderr.write(f"\nparse error: {e}\n")
+            sys.exit(4)
+    sys.stderr.write("no JSON found in claude output:\n")
+    sys.stderr.write(text[:1500] + "\n")
+    sys.exit(4)
+
+
+def validate(data: dict) -> None:
+    required = {"summary", "stack", "directory_structure", "placeholder_files",
+                "tasks", "manifest_dimensions"}
+    missing = required - data.keys()
+    if missing:
+        sys.stderr.write(f"claude output missing fields: {missing}\n")
+        sys.exit(5)
+    for path in list(data["directory_structure"].keys()) + list(data["placeholder_files"].keys()):
+        if not path.startswith("workspace/"):
+            sys.stderr.write(f"refusing to write outside workspace/: {path}\n")
+            sys.exit(6)
+        # Reject path traversal
+        if ".." in Path(path).parts:
+            sys.stderr.write(f"path traversal in {path}\n")
+            sys.exit(6)
+    if not data["tasks"]:
+        sys.stderr.write("no tasks generated\n")
+        sys.exit(7)
+
+
+def render_plan_md(data: dict) -> str:
+    lines = [f"# {ROOT.name} — bootstrapped plan", ""]
+    lines.append(f"_{data['summary']}_")
+    lines.append("")
+    lines.append("Stack: " + ", ".join(data.get("stack", [])))
+    lines.append("")
+    for i, t in enumerate(data["tasks"], 1):
+        lines.append(f"{i}. {t['title']}")
+        if t.get("signal_cmd"):
+            lines.append(f"   signal_cmd: {t['signal_cmd']}")
+        deps = t.get("depends_on") or []
+        if deps:
+            lines.append(f"   depends_on: {deps}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_manifest(data: dict) -> dict:
+    return {
+        "project": ROOT.name,
+        "summary": data["summary"],
+        "stack": data["stack"],
+        "dimensions": data["manifest_dimensions"],
+        "bootstrap_source": "tm-bootstrap from goal.md",
+    }
+
+
+def write_files(data: dict) -> None:
+    # plan.md
+    PLAN.write_text(render_plan_md(data))
+    print(f"  ✓ plan.md  ({len(data['tasks'])} tasks)")
+
+    # manifest.json
+    MANIFEST.write_text(json.dumps(render_manifest(data), indent=2, ensure_ascii=False) + "\n")
+    print(f"  ✓ manifest.json  ({len(data['manifest_dimensions'])} dimensions)")
+
+    # workspace scaffold
+    WORKSPACE.mkdir(exist_ok=True)
+    n_dirs = 0
+    for d in data["directory_structure"]:
+        full = ROOT / d
+        full.mkdir(parents=True, exist_ok=True)
+        n_dirs += 1
+    print(f"  ✓ workspace/  ({n_dirs} directories)")
+
+    n_files = 0
+    for path, content in data["placeholder_files"].items():
+        full = ROOT / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content if content.endswith("\n") else content + "\n")
+        n_files += 1
+    print(f"  ✓ {n_files} placeholder file(s)")
+
+
+def main() -> int:
+    args = parse_args()
+
+    if not GOAL.exists():
+        sys.stderr.write("goal.md not found at project root\n")
+        return 2
+    goal_text = GOAL.read_text().strip()
+    if len(goal_text) < 30:
+        sys.stderr.write(
+            f"goal.md is only {len(goal_text)} chars — too vague for bootstrap. "
+            "Write a few sentences describing what 'done' looks like.\n"
+        )
+        return 2
+
+    blockers = existing_artifacts()
+    if blockers and not args.force:
+        sys.stderr.write(
+            "Refusing to bootstrap because these already exist:\n"
+            + "\n".join(f"  - {b}" for b in blockers)
+            + "\nUse --force to overwrite.\n"
+        )
+        return 1
+
+    print(f"▸ goal.md ({len(goal_text)} chars)")
+    print(f"▸ project: {ROOT.name}")
+
+    prompt = PROMPT_TEMPLATE.format(project=ROOT.name, goal=goal_text)
+    raw = call_claude(prompt, args.model)
+    data = extract_json(raw)
+    validate(data)
+
+    print()
+    print(f"summary:  {data['summary']}")
+    print(f"stack:    {', '.join(data['stack'])}")
+    print(f"tasks:    {len(data['tasks'])}")
+    print(f"dirs:     {len(data['directory_structure'])}")
+    print(f"files:    {len(data['placeholder_files'])}")
+    print(f"dims:     {[d.get('name', '?') for d in data['manifest_dimensions']]}")
+    print()
+
+    if args.dry_run:
+        print("--dry-run: not writing anything. Use without --dry-run to commit.")
+        return 0
+
+    print("Writing files …")
+    write_files(data)
+
+    print()
+    print("✓ bootstrap complete.")
+    print()
+    print("Next steps:")
+    print("  1. Review plan.md  — adjust task wording / order if needed")
+    print("  2. Skim workspace/ — placeholders are minimal; agents will flesh them out")
+    print("  3. ./bin/tm-pm-up  → click ▶ 启动 in the browser")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
