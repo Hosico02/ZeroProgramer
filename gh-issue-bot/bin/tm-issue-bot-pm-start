@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Start the gh-issue-bot sub-PM (separate from the main repo's PM).
+# Always runs in --forever mode (issue tasks arrive dynamically).
+# Foreground by default; `--background` daemonizes via nohup.
+set -euo pipefail
+
+BOT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$BOT_ROOT/.." && pwd)"
+DAEMON="$REPO_ROOT/bin/pm-daemon.py"
+PIDFILE="$BOT_ROOT/pm.pid"
+LOG="$BOT_ROOT/pm.log"
+
+bg=0
+for arg in "$@"; do
+  case "$arg" in
+    --background|-b) bg=1 ;;
+    *) echo "tm-issue-bot-pm-start: unknown arg $arg" >&2; exit 1 ;;
+  esac
+done
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  echo "sub-PM already running (pid $(cat "$PIDFILE"))"
+  exit 0
+fi
+rm -f "$PIDFILE"
+
+if [ "$bg" -eq 1 ]; then
+  : > "$LOG"
+  TM_ROOT="$BOT_ROOT" PM_FOREVER=1 PM_STRICT=1 \
+    nohup python3 "$DAEMON" >> "$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  sleep 0.4
+  if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "✓ sub-PM started (pid $(cat "$PIDFILE")) log: $LOG"
+  else
+    echo "✗ sub-PM failed to start; tail of $LOG:" >&2
+    tail -n 20 "$LOG" >&2 || true
+    exit 1
+  fi
+else
+  exec env TM_ROOT="$BOT_ROOT" PM_FOREVER=1 PM_STRICT=1 \
+    python3 "$DAEMON"
+fi
