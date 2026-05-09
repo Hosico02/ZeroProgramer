@@ -75,9 +75,13 @@ def _git_remote_owner_repo(root: Path) -> str | None:
 
 
 def load_config(bot_root: Path) -> Config:
+    import os
     bot_root = Path(bot_root)
     raw = _parse_env_file(bot_root / ".gh-issue-bot.env")
-    merged = {**_DEFAULTS, **raw}
+    # os.environ overrides file values (useful for testing and systemd units).
+    env_overrides = {k: v for k, v in os.environ.items()
+                     if k in _DEFAULTS or k in ("TM_GH_REPO",)}
+    merged = {**_DEFAULTS, **raw, **env_overrides}
 
     repo = merged.get("TM_GH_REPO") or _git_remote_owner_repo(bot_root)
     if not repo:
