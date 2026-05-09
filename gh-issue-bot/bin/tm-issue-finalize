@@ -72,7 +72,10 @@ COMMIT_SHA="$(git log -1 --format=%H)"
 COMMIT_SHORT="${COMMIT_SHA:0:8}"
 COMMIT_SUBJECT="$(git log -1 --format=%s)"
 COMMIT_BODY="$(git log -1 --format=%b)"
-DIFF_STAT="$(git diff main --stat)"
+# Use origin/main (not local main) so the stat matches what GitHub shows
+# in the PR. Local main may have unpushed commits that would otherwise
+# appear in the stat as "extra" file changes the user didn't make.
+DIFF_STAT="$(git diff origin/main --stat 2>/dev/null || git diff main --stat)"
 
 # Optional cost report (set by tm-issue-bot-resolve when calling us).
 COST_FOOTER=""
@@ -108,7 +111,7 @@ ${DIFF_STAT}
 \`${COMMIT_SHORT}\`${COST_FOOTER}
 
 ---
-_由 gh-issue-bot 在 worktree \`worktrees/issue-${ISSUE}/\` 内自动产出。bot 永不 auto-merge —— 由 owner 根据 issue 自行确认。_
+_由 gh-issue-bot 在 worktree \`worktrees/${TM_ISSUE_BRANCH_PREFIX}/\` 内自动产出。bot 永不 auto-merge —— 由 owner 根据 issue 自行确认。_
 EOF
 )"
 
