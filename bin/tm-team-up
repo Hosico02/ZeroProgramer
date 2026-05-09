@@ -1,65 +1,258 @@
 #!/usr/bin/env bash
-# One-shot bootstrap for the full multi-agent team.
+# One-shot bootstrap for the agent team.
 #
-# Does:
-#   1. tm-pm reset                  (wipe state)
-#   2. tm-pm start --forever        (background daemon, never auto-exits)
-#   3. open SUPERVISOR window       (your "main brain" — opens FIRST)
-#   4. open PLANNER window          (proposes new tasks)
-#   5. open N EXECUTOR windows      (drain the queue)
+# DEFAULT (GUI / headless agents): supervisor + N executors run with no
+# visible terminal windows; the tm-web dashboard auto-opens in your browser
+# at http://localhost:7891 (you don't type a URL — it launches itself).
+# Wrappers run inside python-allocated ptys (claude CLI requires a TTY),
+# with stdout streamed to logs/agent-<role>[-<n>].log and pids tracked in
+# pids/agent-<role>[-<n>].pid.
+#
+# OPT-IN (--native): use bin/tm-dashboard, a tkinter window. Looks more
+# like a desktop app but Apple's bundled Tk 8.5 is buggy with several
+# widget combinations on macOS — treat as experimental.
+#
+# OPT-IN (--windows, legacy): the old behavior — one terminal window
+# per agent (Terminal.app / iTerm2 / wt.exe / gnome-terminal / etc).
+#
+# OPT-IN (4-agent / classic): add `--with-planner` to also run a separate
+# planner. Use when supervisor's combined load is too dense.
 #
 # Usage:
-#   tm-team-up           # 1 supervisor + 1 planner + 1 executor (default)
-#   tm-team-up 2         # ... + 2 executors
-#   tm-team-up 0         # supervisor + planner only, no executor
+#   tm-team-up                          # GUI mode, 1 supervisor + 1 executor
+#   tm-team-up 2                        # GUI mode, + 2 executors
+#   tm-team-up 2 --native               # use tkinter window instead of browser
+#   tm-team-up 2 --windows              # legacy: spawn terminal windows
+#   tm-team-up 2 --no-dashboard         # GUI mode but no dashboard
+#   tm-team-up 2 --no-gh-sync           # skip the periodic GitHub sync loop
+#   tm-team-up 2 --with-planner         # 4-agent (separate planner)
+#   tm-team-up --no-watchdog            # skip the PM watchdog
+#   TM_TEAM_DOWN=1 tm-team-up           # tear down running headless team
 #
-# After windows pop up, type `go` in each of them to kick the agent into
-# its role-specific loop.
+# Helpers started in default GUI mode:
+#   - PM daemon (always)
+#   - PM watchdog (--no-watchdog to skip)
+#   - gh-sync loop (--no-gh-sync to skip; auto-skip if `gh` CLI missing)
+#   - tm-web dashboard (--no-dashboard to skip)
+#
+# Default dashboard is tm-web (browser, auto-opens at localhost:7891 — no
+# URL typing). --native opens the bin/tm-dashboard tkinter window (works
+# but Apple's Tk 8.5 has rendering quirks; experimental).
 set -euo pipefail
 
-N_EXECUTORS="${1:-1}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ROOT_Q="${ROOT//\'/\'\\\'\'}"
+# shellcheck source=/dev/null
+. "$ROOT/bin/_tm-spawn.sh"
+
+want_watchdog=1
+want_planner=0
+want_windows=0
+want_dashboard=1
+want_native=0
+want_gh_sync=1
+N_EXECUTORS=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-watchdog)   want_watchdog=0 ;;
+    --with-planner)  want_planner=1 ;;
+    --windows)       want_windows=1 ;;
+    --no-dashboard)  want_dashboard=0 ;;
+    --native)        want_native=1 ;;
+    --no-gh-sync)    want_gh_sync=0 ;;
+    -h|--help)
+      sed -n '2,40p' "$0"; exit 0 ;;
+    [0-9]*)          N_EXECUTORS="$arg" ;;
+    *) echo "tm-team-up: unknown arg '$arg'" >&2; exit 1 ;;
+  esac
+done
 
 cd "$ROOT"
+mkdir -p logs pids
+
+# ---- helper: stop any previously-spawned headless agents -------------------
+team_down_headless() {
+  shopt -s nullglob
+  local stopped=0
+  for pf in pids/agent-*.pid; do
+    [ -f "$pf" ] || continue
+    if pid="$(cat "$pf" 2>/dev/null)" && [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      stopped=$((stopped + 1))
+    fi
+    rm -f "$pf"
+  done
+  # Also stop the gh-sync loop if it's running.
+  if [ -f gh-sync.pid ]; then
+    if pid="$(cat gh-sync.pid 2>/dev/null)" && [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      stopped=$((stopped + 1))
+    fi
+    rm -f gh-sync.pid
+  fi
+  if [ "$stopped" -gt 0 ]; then
+    echo "  stopped $stopped previous helper(s)"
+    sleep 0.4
+  fi
+  shopt -u nullglob
+}
+
+# ---- TM_TEAM_DOWN=1: tear down only --------------------------------------
+if [ "${TM_TEAM_DOWN:-0}" = "1" ]; then
+  echo "── tearing down headless agents ──"
+  team_down_headless
+  ./bin/tm-pm stop || true
+  echo "✓ team down"
+  exit 0
+fi
 
 echo "── 1. resetting PM state ──"
+team_down_headless
 ./bin/tm-pm reset >/dev/null
 
 echo "── 2. starting pm-daemon (--forever) ──"
 ./bin/tm-pm start --forever | tail -n 2
 
-if ! command -v osascript >/dev/null 2>&1; then
-  echo
-  echo "⚠️  osascript not found. Open these windows manually:"
-  echo "  cd '$ROOT' && ./bin/tm-claude-supervisor"
-  echo "  cd '$ROOT' && ./bin/tm-claude-planner"
+if [ "$want_watchdog" = "1" ]; then
+  echo "── 3. starting pm-watchdog (--forever, background) ──"
+  nohup ./bin/tm-pm watchdog --forever > "$ROOT/pm-watchdog.log" 2>&1 &
+  sleep 0.4
+  if [ -f "$ROOT/pm-watchdog.pid" ]; then
+    echo "✓ watchdog (pid $(cat "$ROOT/pm-watchdog.pid"))  log: pm-watchdog.log"
+  else
+    echo "⚠️  watchdog pidfile not written; check pm-watchdog.log" >&2
+  fi
+else
+  echo "── 3. watchdog SKIPPED (--no-watchdog) ──"
+fi
+
+# ---- git/github sync loop (default-on, auto-skip if gh CLI missing) ----
+if [ "$want_gh_sync" = "1" ] && [ "${TM_GH_ENABLED:-1}" != "0" ]; then
+  if command -v gh >/dev/null 2>&1; then
+    echo "── 3.5 starting gh-sync loop (--forever, background) ──"
+    nohup ./bin/tm-gh-sync-loop --forever > /dev/null 2>&1 &
+    sleep 0.3
+    if [ -f "$ROOT/gh-sync.pid" ]; then
+      interval="${TM_GH_SYNC_INTERVAL:-600}"
+      echo "✓ gh-sync (pid $(cat "$ROOT/gh-sync.pid"))  every ${interval}s  log: gh-sync.log"
+    else
+      echo "⚠️  gh-sync pidfile not written; check gh-sync.log" >&2
+    fi
+  else
+    echo "── 3.5 gh-sync SKIPPED (gh CLI not in PATH; install: https://cli.github.com/) ──"
+  fi
+else
+  [ "$want_gh_sync" = "0" ] && echo "── 3.5 gh-sync SKIPPED (--no-gh-sync) ──"
+  [ "${TM_GH_ENABLED:-1}" = "0" ] && echo "── 3.5 gh-sync SKIPPED (TM_GH_ENABLED=0) ──"
+fi
+
+mode_label="3-agent (supervisor+planner-merged)"
+[ "$want_planner" = "1" ] && mode_label="4-agent (separate planner)"
+
+# ---- LEGACY WINDOWS MODE ---------------------------------------------------
+if [ "$want_windows" = "1" ]; then
+  backend="$(tm_spawn_describe_backend)"
+  echo "── window backend: $backend  |  mode: $mode_label ──"
+
+  spawn_or_warn() {
+    if ! tm_spawn_terminal_window "$ROOT" "$2"; then
+      echo "⚠️  could not auto-spawn $1 window. Open manually:"
+      echo "    cd '$ROOT' && $2"
+      return 1
+    fi
+  }
+
+  echo "── 4. spawning SUPERVISOR window ──"
+  spawn_or_warn "SUPERVISOR" "./bin/tm-claude-supervisor" || true
+  sleep 0.4
+
+  if [ "$want_planner" = "1" ]; then
+    echo "── 5. spawning PLANNER window ──"
+    spawn_or_warn "PLANNER" "./bin/tm-claude-planner" || true
+    sleep 0.4
+  fi
+
   for i in $(seq 1 "$N_EXECUTORS"); do
-    echo "  cd '$ROOT' && ./bin/tm-claude-executor   # executor #$i"
+    echo "── 6.$i spawning EXECUTOR #$i window ──"
+    spawn_or_warn "EXECUTOR #$i" "./bin/tm-claude-executor" || true
+    sleep 0.3
   done
+
+  echo
+  echo "✓ team up (windows mode): 1 supervisor + ${want_planner:+1 planner + }$N_EXECUTORS executor(s) — $mode_label"
+  [ "$want_watchdog" = "1" ] && echo "  watchdog active — PM auto-restarts on crash (rate-limited 5/60s)"
+  echo "  every window auto-submits 'go' — agents start working without manual input"
+  echo "  monitor real-time:   ./bin/tm-pm watch"
+  echo "  graceful shutdown:   ./bin/tm-pm shutdown 'reason'"
   exit 0
 fi
 
-spawn_terminal_window() {
-  osascript -e "tell application \"Terminal\" to do script \"cd '${ROOT_Q}' && $1\"" >/dev/null
+# ---- DEFAULT: GUI / HEADLESS MODE -----------------------------------------
+echo "── headless agents (GUI mode)  |  mode: $mode_label ──"
+
+spawn_headless() {
+  # $1 = label (e.g. "supervisor", "executor-1"), $2 = wrapper script path
+  local label="$1" wrapper="$2"
+  local logf="logs/agent-${label}.log"
+  local pidf="pids/agent-${label}.pid"
+  python3 "$ROOT/bin/_tm-pty-bg.py" "$ROOT/$logf" "$ROOT/$pidf" "$wrapper" "go"
+  # _tm-pty-bg.py daemonizes itself; give the cmd a moment to write its pidfile
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$ROOT/$pidf" ] && break
+    sleep 0.1
+  done
+  if [ -s "$ROOT/$pidf" ]; then
+    echo "  ✓ $label (pid $(cat "$ROOT/$pidf"))  log: $logf"
+  else
+    echo "  ⚠️  $label: pidfile not written (check $logf)" >&2
+  fi
 }
 
-echo "── 3. spawning SUPERVISOR window ──"
-spawn_terminal_window "./bin/tm-claude-supervisor"
-sleep 0.4
+echo "── 4. starting SUPERVISOR (headless) ──"
+spawn_headless "supervisor" "$ROOT/bin/tm-claude-supervisor"
 
-echo "── 4. spawning PLANNER window ──"
-spawn_terminal_window "./bin/tm-claude-planner"
-sleep 0.4
+if [ "$want_planner" = "1" ]; then
+  echo "── 5. starting PLANNER (headless) ──"
+  spawn_headless "planner" "$ROOT/bin/tm-claude-planner"
+fi
 
 for i in $(seq 1 "$N_EXECUTORS"); do
-  echo "── 5.$i spawning EXECUTOR #$i window ──"
-  spawn_terminal_window "./bin/tm-claude-executor"
-  sleep 0.3
+  echo "── 6.$i starting EXECUTOR #$i (headless) ──"
+  spawn_headless "executor-$i" "$ROOT/bin/tm-claude-executor"
 done
 
+# ---- launch dashboard ------------------------------------------------------
+# Default: tm-web — Python stdlib HTTP dashboard that auto-opens the browser
+# at http://localhost:7891 (no URL to type, no extra deps). Reliable across
+# macOS / Linux because it dodges Tk's many native-rendering quirks.
+#
+# Opt-in: --native uses bin/tm-dashboard (tkinter window). Looks more
+# "appy" but Apple's bundled Tk 8.5 is buggy with several widget combos
+# on macOS; treat as experimental.
+if [ "$want_dashboard" = "1" ]; then
+  if [ "${TM_NATIVE_DASHBOARD:-0}" = "1" ] || [ "${want_native:-0}" = "1" ]; then
+    if python3 -c "import tkinter" 2>/dev/null; then
+      echo "── 7. opening native dashboard (tkinter, experimental) ──"
+      nohup python3 "$ROOT/bin/tm-dashboard" >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+      echo "  ✓ tm-dashboard launched"
+    else
+      echo "⚠️  python3 tkinter unavailable — falling back to tm-web"
+      nohup python3 "$ROOT/bin/tm-web" >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+    fi
+  else
+    echo "── 7. opening dashboard (browser, auto-launches) ──"
+    nohup python3 "$ROOT/bin/tm-web" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    echo "  ✓ tm-web launched at http://localhost:7891 (browser opens automatically)"
+  fi
+fi
+
 echo
-echo "✓ team up: 1 supervisor + 1 planner + $N_EXECUTORS executor(s)"
-echo "  every window auto-submits 'go' — agents start working without manual input"
-echo "  monitor real-time:   ./bin/tm-pm watch"
-echo "  monitor event flow:  ./bin/tm-pm tail"
+echo "✓ team up (GUI mode): 1 supervisor + ${want_planner:+1 planner + }$N_EXECUTORS executor(s) — $mode_label"
+[ "$want_watchdog" = "1" ] && echo "  watchdog active — PM auto-restarts on crash (rate-limited 5/60s)"
+echo "  agent logs:          tail -f $ROOT/logs/agent-*.log"
+[ -f "$ROOT/gh-sync.pid" ] && echo "  gh-sync log:         tail -f $ROOT/gh-sync.log"
+echo "  graceful shutdown:   ./bin/tm-pm shutdown 'reason'  (workers exit on next tm-done)"
+echo "  hard tear-down:      TM_TEAM_DOWN=1 ./bin/tm-team-up"
+echo "  reopen dashboard:    ./bin/tm-web &  (or ./bin/tm-dashboard for native)"

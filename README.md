@@ -1,4 +1,4 @@
-# claude-team-demo
+# ZeroProgramer
 
 [中文](README.zh.md) | **English**
 
@@ -76,7 +76,7 @@ Roles in detail:
 The bundled demo points workspace/ at a copy of the framework itself, so the agent team optimizes the very code it's made of.
 
 ```bash
-cd claude-team-demo
+cd ZeroProgramer
 ./bin/setup-self-optimize       # copies framework into workspace/
 ./bin/tm-team-up 2              # opens 4 Terminal windows: 1 supervisor + 1 planner + 2 executors
 ./bin/tm-pm watch               # in another terminal: real-time dashboard
@@ -121,13 +121,23 @@ cp -r ~/source/* workspace/           # populate workspace with code to be manag
 ./bin/tm-pm shutdown "<reason>"   # graceful (lets in-flight tasks finish)
 ./bin/tm-pm stop                  # force-stop daemon
 ./bin/tm-pm reset                 # wipe runtime state and start over
+TM_TEAM_DOWN=1 ./bin/tm-team-up   # hard tear-down (kills agents + watchdog + gh-sync loop)
 ```
+
+`tm-team-up` (default GUI mode) brings up four background helpers:
+
+| Helper | Started by default | Skip with | Purpose |
+|---|---|---|---|
+| **PM daemon** | yes | — | Dispatches tasks to workers (zero-token state machine) |
+| **PM watchdog** | yes | `--no-watchdog` | Auto-restarts PM on crash (rate-limited 5/60s) |
+| **gh-sync loop** | yes (auto-skip if no `gh` CLI) | `--no-gh-sync` | Mirrors `escalations/` to GitHub Issues every 10 min |
+| **tm-web dashboard** | yes | `--no-dashboard` | Browser dashboard auto-opens at `localhost:7891` |
 
 ### Monitor (run in any spare terminal — zero token cost)
 
 ```bash
 ./bin/tm-pm watch                 # 1Hz terminal dashboard
-./bin/tm-web                      # 1Hz browser dashboard at http://localhost:7891
+./bin/tm-web                      # 1Hz browser dashboard at http://localhost:7891 (incl. Claude budget meter)
 ./bin/tm-pm status                # one-shot snapshot
 ./bin/tm-pm tail                  # live PM event log
 ./bin/tm-status-report            # generate markdown report under status-reports/
@@ -137,12 +147,15 @@ cp -r ~/source/* workspace/           # populate workspace with code to be manag
 ./bin/tm-context list             # all task statuses
 ./bin/tm-context done             # done tasks with summaries
 ./bin/tm-decision list            # supervisor's decision log
+./bin/tm-github-sync              # one-shot escalation → GitHub issue sync
+./bin/tm-github-sync --dry-run    # preview what would change
+tail -f gh-sync.log               # see periodic sync results
 ```
 
 **Each Claude window's title bar shows live project state** (workaround for Claude Code's statusLine refreshing only on agent turns):
 
 ```
-● claude-team-demo · 8/13 · ▶3 · 3/4w · sup
+● ZeroProgramer · 8/13 · ▶3 · 3/4w · sup
 ```
 project-name · `done/total` · `▶in_progress` · `busy/total workers` · role abbreviation
 
@@ -213,7 +226,9 @@ project/
 ├── proposals/               # LLM-brainstormed ambitious directions awaiting supervisor review
 │   └── 2026-05-08T11-15Z-web-dashboard.md
 ├── goal-history/            # snapshot of goal.md before each L6 revision
-├── escalations/             # tasks that permanently failed (ideally empty)
+├── escalations/             # tasks that permanently failed (auto-mirrored to GitHub Issues)
+├── .gh-issue-map.json       # escalation file → live GitHub issue number (managed by tm-github-sync)
+├── gh-sync.log              # periodic-sync result log (one entry per 10 min)
 ├── workspace/               # the code executors actually edit
 ├── pm.log                   # PM event stream
 ├── supervisor.log           # supervisor decisions
@@ -241,12 +256,92 @@ When tokens run out: planner / executor calls fail → escalations → superviso
 
 ---
 
+## Git / GitHub management
+
+ZeroProgramer keeps **escalations in sync with GitHub Issues** automatically. Whenever a task fails permanently and lands in `escalations/task-NNNN.md`, the linked GitHub issue is opened (or closed when the escalation is resolved). This gives you a familiar inbox for human follow-up without leaving the loop.
+
+```
+escalations/task-0042.md  ←── auto-mirrored ──→  github.com/<owner>/<repo>/issues/127
+```
+
+### How it runs
+
+`tm-team-up` (default GUI mode) starts a background **`tm-gh-sync-loop`** alongside the PM daemon and watchdog. The loop calls `tm-github-sync` once at startup, then every `TM_GH_SYNC_INTERVAL` seconds (default 600 = 10 min). Result: opening or closing escalations propagates to GitHub within ~10 min, no manual cron.
+
+Auto-skip rules — the loop **silently skips** any iteration when:
+- `gh` CLI isn't on `PATH` (install from <https://cli.github.com/>)
+- `TM_GH_ENABLED=0` is set (project is on GitLab / Bitbucket / not hosted)
+- `git remote get-url origin` doesn't yield a GitHub URL
+
+So safe to leave on for non-GitHub projects — it just no-ops every 10 min.
+
+### One-shot or dry-run
+
+```bash
+./bin/tm-github-sync             # one-shot sync (what the loop calls)
+./bin/tm-github-sync --dry-run   # show what would change without doing it
+./bin/tm-gh-sync-loop            # foreground single-shot for debugging
+```
+
+### Mapping & state
+
+- **Mapping file**: `.gh-issue-map.json` at repo root — `task-NNNN.md → issue#`. Wiped by `tm-pm reset` along with other runtime state.
+- **Loop log**: `gh-sync.log` — one line per pass, captures sync output and any auth/network errors.
+- **PID file**: `gh-sync.pid` — used by `tm-team-up` teardown.
+
+### Direction
+
+Currently one-way (`escalations → issues`). Coming work in `vision.md`: reverse direction (issue label `tm-fix` → automatic escalation), and broader git plumbing (auto-commit promoted workspace changes, branch-per-task, PR creation when `goal.md` ships). Tracked under "GitHub-native loop" in vision.md.
+
+### Configuration (env vars)
+
+| Env | Default | Controls |
+|---|---|---|
+| `TM_GH_ENABLED` | `1` | Set to `0` to disable sync entirely (loop becomes no-op) |
+| `TM_GH_REPO` | from `git remote` | Override target repo, e.g. `owner/repo` |
+| `TM_GH_LABEL` | `tm-escalation` | GitHub label attached to opened issues |
+| `TM_GH_SYNC_INTERVAL` | `600` | Seconds between loop iterations |
+
+---
+
+## Task grammar
+
+Tasks are defined in `plan.md` using a simple text format:
+
+```
+1. First task
+   signal_cmd: make build
+   additional context on continuation lines
+
+2. Second task (no signal_cmd required)
+
+3. Third task
+   signal_cmd: pytest -q tests/
+   depends_on: [1, 2]
+```
+
+**Grammar rules:**
+- Numbered items (`1.`, `2.`, ...) or bulleted items (`-`, `*`) start a new task
+- Blank lines separate task blocks
+- `signal_cmd: <command>` (indented) — optional shell command executed by `tm-done`; retried up to `MAX_SIGNAL` times (default: 5) before task is marked failed and escalated
+- `depends_on: <id-list>` (indented) — optional dependency declaration; task waits until all parent tasks are done
+- Continuation lines (indented, no special prefix) extend the task title for documentation
+
+**Signal command behavior (strict mode + signal_cmd):**
+- Executor runs `tm-done "<summary>"` → PM checks if task has a `signal_cmd`
+- If yes, `tm-done` executes it and reports the exit code
+- Exit 0 → task marked done immediately (skips LLM review when in strict mode)
+- Exit non-zero → task sent back to todo queue with history, re-assigned with feedback
+- After `MAX_SIGNAL` consecutive failures → task marked failed and escalated
+
+---
+
 ## Configuration (env vars)
 
 | Env | Default | Controls |
 |---|---|---|
 | `PM_FOREVER` | 0 | 1 = idle on empty queue, exit only on shutdown event |
-| `PM_STRICT` | 0 | 1 = run tm-review on every done event |
+| `PM_STRICT` | 0 | 1 = run tm-review on every done event (or skip review for tasks with signal_cmd; see Strict mode below) |
 | `PM_GOAL_REVIEW` | 0 | 1 = run tm-goal-review before exit-on-all-done |
 | `STALE_AFTER_SEC` (constant) | 120 | Seconds without events before a worker is GC'd |
 | `NAG_AFTER_SEC` | 40 | Seconds of work before PM nags a worker |
@@ -257,6 +352,40 @@ When tokens run out: planner / executor calls fail → escalations → superviso
 | `PLANNER_INTERVAL` | 60 | Pace for the bash-based `tm-planner` daemon |
 | `TM_MODEL_VERIFIER` | (claude default) | Model for deterministic checks (`tm-review`, `tm-goal-review`). Recommend a cheap fast model: `claude-haiku-4-5-20251001` |
 | `TM_MODEL_CREATIVE` | (claude default) | Model for creative work (`tm-profile`, `tm-assess`, `tm-vision`, `tm-plan`, `tm-auto-loop`). Use the strong default unless you want to test a specific version. |
+
+### Strict mode (quality gate)
+
+Set `PM_STRICT=1` to enable automatic code review before marking tasks done:
+
+```bash
+export PM_STRICT=1
+./bin/tm-team-up 2
+```
+
+**Strict mode review loop:**
+1. Worker runs `tm-done "<summary>"` with task complete
+2. PM checks if task has a `signal_cmd` field:
+   - **If yes**: `tm-done` already executed the signal_cmd and verified it exited 0 (or would re-queue); LLM review is skipped (cost optimization)
+   - **If no**: PM spawns `tm-review` to judge the worker's output (code quality, test coverage, docs completeness, etc.)
+3. Review verdict on each attempt:
+   - **PASS** → task marked done, moves to next task
+   - **FAIL** → task sent back to todo queue with reviewer feedback; re-assigned with context "⚠️ previously failed review (N/3); address feedback" (where N is current attempt: 1, 2, or 3)
+4. Retry limit: After `MAX_REVIEW` consecutive review failures (default: 3 attempts) → task marked **failed** and escalated to escalations/ directory
+
+**Review retry counter examples:**
+- Attempt 1 fails → "⚠️ previously failed review (1/3); address feedback"
+- Attempt 2 fails → "⚠️ previously failed review (2/3); address feedback"
+- Attempt 3 fails → task marked failed, escalated, no more retries
+- Any attempt passes → task done immediately, remaining attempts unused
+
+Use `PM_REVIEW_ALWAYS=1` (in strict mode) to force LLM review even for tasks with passing `signal_cmd`:
+
+```bash
+export PM_STRICT=1 PM_REVIEW_ALWAYS=1
+./bin/tm-team-up 2
+```
+
+This trades cost (2× token spend per signal_cmd task) for extra confidence when signal_cmd alone isn't sufficient.
 
 ### Multi-LLM cost optimization
 
@@ -289,6 +418,8 @@ export TM_MODEL_VERIFIER=claude-haiku-4-5-20251001
 | Worker count climbs unbounded | User opened too many windows / used `/clear` repeatedly; `./bin/tm-pm gc` purges stale ones |
 | PM crashed | Check tail of `pm.log` for traceback; `./bin/tm-pm start` to restart |
 | Want to start over | `./bin/tm-pm reset && ./bin/tm-team-up 2` |
+| GitHub issues not updating | `tail -20 gh-sync.log`; auth: `gh auth status`; install: <https://cli.github.com/> |
+| Project isn't on GitHub | Set `TM_GH_ENABLED=0` (or pass `--no-gh-sync` once) — sync loop becomes a no-op |
 
 ---
 
@@ -314,22 +445,16 @@ bin/
 ├── tm-done                   # executor CLI
 ├── tm-context                # task / history queries
 ├── tm-vision                 # innovation channel: add / propose / list / show / edit
-├── tm-github-sync            # mirror escalations to GitHub Issues
-├── tm-web                    # browser dashboard (single-page, polls /api/state)
+├── tm-github-sync            # one-shot mirror of escalations → GitHub Issues
+├── tm-gh-sync-loop           # background daemon that calls tm-github-sync every 10 min
+├── tm-web                    # browser dashboard (single-page, polls /api/state, shows Claude budget)
+├── tm-dashboard              # native tkinter dashboard (--native; experimental on macOS)
 ├── tm-title-keeper           # live window-title refresher
 ├── tm-status-title           # title bar text generator
 ├── tm-statusline             # Claude Code statusLine command
 ├── tm-{session,prompt,stop,tool}-hook    # Claude Code hooks
 └── tm-{plan,review,assess,goal-review,profile}    # one-shot claude -p tools
 ```
-
-### `gh-issue-bot/` (optional)
-
-A standalone sub-project that watches a configured GitHub repo for issues
-labelled `auto-fix` and resolves them autonomously by spawning a Claude
-session per issue inside an isolated git worktree, then opening a PR with
-`Closes #N`. Install with `gh-issue-bot/bin/tm-issue-bot install`. See
-`gh-issue-bot/README.md` and `docs/superpowers/specs/2026-05-09-gh-issue-bot-design.md`.
 
 ---
 

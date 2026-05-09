@@ -22,6 +22,7 @@ import re
 import socketserver
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
@@ -35,6 +36,13 @@ DECISIONS_DIR = ROOT / "decisions"
 STATUS_REPORTS_DIR = ROOT / "status-reports"
 PROPOSALS_DIR = ROOT / "proposals"
 PID_FILE = ROOT / "pm.pid"
+
+# cc-budget — global Claude Code rate-limit meter. Same files the
+# (now-retired) statusLine read; we surface it in the dashboard instead.
+CC_BUDGET_CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "cc-budget"
+CC_BUDGET_FILE = CC_BUDGET_CACHE_DIR / "budget.json"
+CC_BUDGET_DAEMON_PID = CC_BUDGET_CACHE_DIR / "daemon.pid"
+CC_BUDGET_STALE_SEC = 15 * 60  # cache older than this → render as stale
 
 
 def daemon_running() -> bool:
@@ -64,6 +72,68 @@ def tail_log(path: Path, n: int = 30) -> list[str]:
         return path.read_text(errors="ignore").splitlines()[-n:]
     except Exception:
         return []
+
+
+def read_cc_budget() -> dict:
+    """Read cc-budget's cached rate-limit data and the daemon's liveness.
+    Returns a dict with shape:
+      { "available": bool,
+        "stale": bool,                 # cache > CC_BUDGET_STALE_SEC old
+        "daemon_alive": bool,
+        "ts": int|None,                # cache write time (epoch)
+        "age_sec": int|None,           # how old the cache is right now
+        "h5_pct": float|None,          # 0..1, 5h utilization
+        "h5_reset": int|None,          # epoch when 5h window resets
+        "d7_pct": float|None,          # 0..1, 7d utilization
+        "d7_reset": int|None }         # epoch when 7d window resets
+    """
+    out = {
+        "available": False, "stale": False, "daemon_alive": False,
+        "ts": None, "age_sec": None,
+        "h5_pct": None, "h5_reset": None,
+        "d7_pct": None, "d7_reset": None,
+    }
+    # daemon liveness
+    if CC_BUDGET_DAEMON_PID.exists():
+        try:
+            pid = int(CC_BUDGET_DAEMON_PID.read_text().strip())
+            os.kill(pid, 0)
+            out["daemon_alive"] = True
+        except Exception:
+            out["daemon_alive"] = False
+    if not CC_BUDGET_FILE.exists():
+        return out
+    try:
+        d = json.loads(CC_BUDGET_FILE.read_text())
+    except Exception:
+        return out
+    out["available"] = True
+    ts = d.get("ts")
+    if isinstance(ts, (int, float)):
+        out["ts"] = int(ts)
+        out["age_sec"] = max(0, int(time.time() - ts))
+        out["stale"] = out["age_sec"] > CC_BUDGET_STALE_SEC
+    rl = d.get("rate_limits", {}) or {}
+
+    def _f(key):
+        v = rl.get(key)
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    def _i(key):
+        v = rl.get(key)
+        try:
+            return int(float(v)) if v is not None else None
+        except Exception:
+            return None
+
+    out["h5_pct"] = _f("anthropic-ratelimit-unified-5h-utilization")
+    out["h5_reset"] = _i("anthropic-ratelimit-unified-5h-reset")
+    out["d7_pct"] = _f("anthropic-ratelimit-unified-7d-utilization")
+    out["d7_reset"] = _i("anthropic-ratelimit-unified-7d-reset")
+    return out
 
 
 def list_dir_md(d: Path, n: int = 8) -> list[dict]:
@@ -129,6 +199,13 @@ INDEX_HTML = """<!doctype html>
   <div class="header">
     <h1 id="proj">— · loading…</h1>
     <div class="small">refreshes every 1s · <span id="ts">—</span></div>
+  </div>
+
+  <div class="grid">
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Claude budget · account-wide</h2>
+      <div id="cc-budget" class="small">—</div>
+    </div>
   </div>
 
   <div class="grid">
@@ -207,6 +284,9 @@ function render(s) {
   const dot = s.daemon_running ? '<span class="dot green">●</span>' : '<span class="dot muted">○</span>';
   $("proj").innerHTML = `${dot} ${s.project} <span class="small">· role-aware multi-agent dashboard</span>`;
   $("ts").textContent = new Date().toLocaleTimeString();
+
+  // cc-budget
+  $("cc-budget").innerHTML = render_budget(s.cc_budget || {});
 
   const ts = s.tasks || [];
   const done = ts.filter(t => t.status === "done").length;
@@ -290,6 +370,43 @@ function escape_html(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 }
 
+function fmt_until(epoch) {
+  if (!epoch) return "—";
+  const secs = epoch - Math.floor(Date.now() / 1000);
+  if (secs <= 0) return "now";
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+  if (h >= 24) return `${Math.floor(h/24)}d${h%24}h`;
+  if (h)      return `${h}h${String(m).padStart(2,"0")}m`;
+  return `${m}m`;
+}
+
+function render_budget(b) {
+  if (!b || !b.available) {
+    const dpid = b && b.daemon_alive ? '<span class="pill green">daemon ●</span>' : '<span class="pill muted">daemon ○</span>';
+    return `${dpid} <span class="small">no cache yet — check ~/.cache/cc-budget/budget.json or run <code>cc-budget install</code></span>`;
+  }
+  const pct_class = p => p >= 0.85 ? "red" : (p >= 0.6 ? "yellow" : "green");
+  const bar = p => {
+    const cls = pct_class(p);
+    const pct = Math.min(100, Math.round(p * 100));
+    return `<div style="display:inline-block;vertical-align:middle;width:140px;height:8px;background:rgba(125,133,144,.18);border-radius:4px;overflow:hidden;margin:0 .4rem;">
+      <div style="height:100%;width:${pct}%;background:var(--${cls === 'red' ? 'red' : cls === 'yellow' ? 'yellow' : 'green'});"></div>
+    </div>`;
+  };
+  const stale = b.stale ? '<span class="pill yellow">stale</span>' : '';
+  const dpid = b.daemon_alive ? '<span class="pill green">daemon ●</span>' : '<span class="pill red">daemon ○</span>';
+  const h5 = b.h5_pct == null ? '<span class="small">5h —</span>'
+    : `<span class="pill ${pct_class(b.h5_pct)}">5h ${(b.h5_pct*100).toFixed(0)}%</span>${bar(b.h5_pct)}<span class="small">resets ${fmt_until(b.h5_reset)}</span>`;
+  const d7 = b.d7_pct == null ? '<span class="small">7d —</span>'
+    : `<span class="pill ${pct_class(b.d7_pct)}">7d ${(b.d7_pct*100).toFixed(0)}%</span>${bar(b.d7_pct)}<span class="small">resets ${fmt_until(b.d7_reset)}</span>`;
+  const age = b.age_sec == null ? '' : ` · cache ${b.age_sec}s old`;
+  return `<div style="display:flex;flex-wrap:wrap;gap:1rem;align-items:center;">
+    <div>${h5}</div>
+    <div>${d7}</div>
+    <div>${dpid} ${stale}<span class="small">${age}</span></div>
+  </div>`;
+}
+
 refresh();
 setInterval(refresh, 1000);
 </script>
@@ -333,6 +450,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "status_reports": list_dir_md(STATUS_REPORTS_DIR, 8),
             "decisions": list_dir_md(DECISIONS_DIR, 8),
             "proposals": list_dir_md(PROPOSALS_DIR, 8),
+            "cc_budget": read_cc_budget(),
             "ts": datetime.datetime.utcnow().isoformat() + "Z",
         }
 

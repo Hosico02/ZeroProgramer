@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# tm-gh-sync-loop — periodic wrapper around tm-github-sync.
+#
+# Runs as a lightweight bash daemon: sleeps TM_GH_SYNC_INTERVAL seconds
+# between sync attempts, logs each pass to gh-sync.log, writes pid to
+# gh-sync.pid. Stops cleanly on SIGTERM/SIGINT.
+#
+# Auto-skip rules: if `gh` CLI is missing, TM_GH_ENABLED=0, or the repo
+# can't be detected, exit 0 immediately so tm-team-up's startup doesn't
+# fail just because the project isn't on GitHub. The decision to skip is
+# logged and re-checked on each loop iteration (so installing `gh` later
+# brings the loop online without restarting the daemon).
+#
+# Usage:
+#   tm-gh-sync-loop              # foreground (mostly for debugging)
+#   tm-gh-sync-loop --forever &  # background; tm-team-up uses this form
+#
+# Env:
+#   TM_GH_SYNC_INTERVAL    seconds between syncs (default: 600 = 10min)
+#   TM_GH_ENABLED          set to 0 to disable entirely (loop exits)
+#   TM_GH_REPO, TM_GH_LABEL  passed through to tm-github-sync
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PIDFILE="$ROOT/gh-sync.pid"
+LOG="$ROOT/gh-sync.log"
+INTERVAL="${TM_GH_SYNC_INTERVAL:-600}"
+
+# Only block --forever-style invocation; foreground for debugging is fine.
+forever=0
+[ "${1:-}" = "--forever" ] && forever=1
+
+# Ensure only one loop runs at a time.
+if [ -f "$PIDFILE" ]; then
+  old="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    echo "tm-gh-sync-loop: already running (pid $old); refusing to start a second instance" >&2
+    exit 1
+  fi
+  rm -f "$PIDFILE"
+fi
+echo $$ > "$PIDFILE"
+
+cleanup() {
+  rm -f "$PIDFILE"
+}
+trap 'cleanup; exit 0' TERM INT
+trap 'cleanup' EXIT
+
+log() {
+  printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG"
+}
+
+should_run_now() {
+  # Returns 0 if we should attempt a sync this iteration, 1 to skip.
+  if [ "${TM_GH_ENABLED:-1}" = "0" ]; then
+    return 1
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+log "started (interval=${INTERVAL}s, forever=${forever})"
+
+# First-iteration banner so the user can confirm it's alive even if the
+# first scheduled tick is 10 min away.
+if should_run_now; then
+  log "initial sync …"
+  if "$ROOT/bin/tm-github-sync" >> "$LOG" 2>&1; then
+    log "  ok"
+  else
+    log "  failed (exit $?)"
+  fi
+else
+  log "skipping initial sync (gh CLI missing or TM_GH_ENABLED=0)"
+fi
+
+# Foreground mode: run once and exit.
+if [ "$forever" != "1" ]; then
+  log "single-shot mode complete"
+  exit 0
+fi
+
+while :; do
+  sleep "$INTERVAL" &
+  sleep_pid=$!
+  wait "$sleep_pid" 2>/dev/null || true
+
+  if should_run_now; then
+    log "sync …"
+    if "$ROOT/bin/tm-github-sync" >> "$LOG" 2>&1; then
+      log "  ok"
+    else
+      log "  failed (exit $?)"
+    fi
+  else
+    log "skip (gh CLI missing or TM_GH_ENABLED=0)"
+  fi
+done

@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+# tm-dashboard — native tkinter window for ZeroProgramer.
+#
+# Two tabs:
+#   迭代项目  — PM/worker/task state, scrolling per-agent log tail
+#   Issue 管理 — github-sync state, escalation→issue map, sync trigger
+#
+# Read-only on the iteration tab; the Issues tab can fire `tm-github-sync`.
+# Polls disk state every REFRESH_MS — no IPC, same files tm-web reads.
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import ttk, font, scrolledtext
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE_FILE = ROOT / "pm-state.json"
+PM_PID = ROOT / "pm.pid"
+WATCHDOG_PID = ROOT / "pm-watchdog.pid"
+LOGS_DIR = ROOT / "logs"
+PIDS_DIR = ROOT / "pids"
+GH_MAP = ROOT / ".gh-issue-map.json"
+ESC_DIR = ROOT / "escalations"
+
+REFRESH_MS = 3000
+LOG_TAIL_LINES = 80
+LOG_TAIL_BYTES = 32 * 1024
+ISSUES_REFRESH_EVERY_N_TICKS = 5  # Issues data is near-static; don't fork git every tick
+
+# claude CLI repaints its statusline / progress UI with ANSI escapes; under
+# pty capture every redraw lands in the log file. Tk's Text widget renders
+# poorly (or hangs) on raw ESC streams, so we strip them before display.
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][AB012]|[=>78@-Z\\-_])")
+_CTRL_KEEP = {"\n", "\t"}
+
+
+def strip_ansi(s: str) -> str:
+    s = _ANSI_RE.sub("", s)
+    # collapse stray CRs (statusline rewrites use \r); drop other control chars
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(c for c in s if c >= " " or c in _CTRL_KEEP)
+
+EMPTY_WORKERS_HINT = "（暂无 worker — 上面点 ▶ 启动队伍）"
+EMPTY_LOG_HINT = "（日志为空 — agents 还没启动，或刚刚拆掉）"
+EMPTY_ISSUES_HINT = "（暂无映射 — 还没跑过 tm-github-sync）"
+
+
+# ---------------------------------------------------------------- helpers ----
+def pid_alive(pidfile: Path) -> bool:
+    if not pidfile.exists():
+        return False
+    try:
+        pid = int(pidfile.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def read_state() -> dict:
+    if not STATE_FILE.exists():
+        return {"tasks": [], "workers": {}, "known_roles": {}}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {"tasks": [], "workers": {}, "known_roles": {}}
+
+
+def tail_text(path: Path, n=LOG_TAIL_LINES, max_bytes=LOG_TAIL_BYTES) -> str:
+    if not path.exists():
+        return ""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            f.seek(max(0, size - max_bytes))
+            data = f.read()
+        text = strip_ansi(data.decode(errors="ignore"))
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        return "\n".join(lines[-n:])
+    except Exception as e:
+        return f"(failed to read {path.name}: {e})"
+
+
+def discover_log_sources() -> dict:
+    """Build the dropdown of available log streams."""
+    sources: dict[str, Path] = {}
+    if (ROOT / "pm.log").exists():
+        sources["pm.log"] = ROOT / "pm.log"
+    if (ROOT / "supervisor.log").exists():
+        sources["supervisor.log"] = ROOT / "supervisor.log"
+    if (ROOT / "pm-watchdog.log").exists():
+        sources["pm-watchdog.log"] = ROOT / "pm-watchdog.log"
+    if LOGS_DIR.is_dir():
+        for f in sorted(LOGS_DIR.glob("agent-*.log")):
+            sources[f.name] = f
+    return sources
+
+
+def fmt_uptime(started_ts: str) -> str:
+    if not started_ts:
+        return "—"
+    try:
+        # ISO-8601 with trailing Z
+        ts = started_ts.replace("Z", "+00:00")
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(ts)
+        now = datetime.now(timezone.utc)
+        secs = int((now - dt).total_seconds())
+        if secs < 60:
+            return f"{secs}s"
+        if secs < 3600:
+            return f"{secs // 60}m{secs % 60:02d}s"
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+    except Exception:
+        return started_ts[:19] if isinstance(started_ts, str) else "—"
+
+
+_REPO_CACHE: str | None = None
+_REPO_RESOLVED = False
+
+
+def detect_repo() -> str | None:
+    """Resolve the repo slug once and cache it — git is rarely going to
+    change `origin` mid-session, and forking the binary every tick is the
+    single biggest source of refresh cost in the issues tab."""
+    global _REPO_CACHE, _REPO_RESOLVED
+    if _REPO_RESOLVED:
+        return _REPO_CACHE
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2,
+        )
+        url = r.stdout.strip()
+        if not url:
+            _REPO_CACHE = None
+        else:
+            m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", url)
+            _REPO_CACHE = m.group(1) if m else url
+    except Exception:
+        _REPO_CACHE = None
+    _REPO_RESOLVED = True
+    return _REPO_CACHE
+
+
+# ---------------------------------------------------------------- iter tab ---
+class IterationTab(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, padx=4, pady=4)
+
+        # Quick-start row: N spinbox + Start / Stop buttons (so the dashboard
+        # is useful even before a team is running).
+        qs = tk.Frame(self)
+        qs.pack(fill="x", pady=(0, 4))
+        tk.Label(qs, text="Executors:").pack(side="left")
+        self.n_var = tk.StringVar(value="1")
+        # macOS tk has known render issues with ttk.Spinbox + state=readonly +
+        # clam theme — Combobox is bulletproof for the same purpose.
+        n_box = ttk.Combobox(qs, textvariable=self.n_var, width=2,
+                             state="readonly",
+                             values=[str(i) for i in range(0, 9)])
+        n_box.pack(side="left", padx=(2, 6))
+        self.start_btn = tk.Button(qs, text="▶ 启动", command=self._start_team)
+        self.start_btn.pack(side="left", padx=2)
+        self.stop_btn = tk.Button(qs, text="■ 停止", command=self._stop_team)
+        self.stop_btn.pack(side="left", padx=2)
+
+        self.pm_lbl = tk.Label(qs, text="● PM ?", font=("Helvetica", 11, "bold"))
+        self.pm_lbl.pack(side="right")
+        self.wd_lbl = tk.Label(qs, text="wd?", foreground="#888")
+        self.wd_lbl.pack(side="right", padx=(0, 8))
+
+        # Progress one-liner
+        self.progress_lbl = tk.Label(self, text="—", foreground="#666")
+        self.progress_lbl.pack(anchor="w", pady=(0, 4))
+
+        # Workers table (compact)
+        tk.Label(self, text="Workers", font=("Helvetica", 10, "bold"),
+                  foreground="#444").pack(anchor="w")
+        cols = ("role", "sid", "pid", "status", "uptime", "task")
+        widths = (70, 90, 50, 70, 60, 220)
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=3)
+        for c, w in zip(cols, widths):
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=w, anchor="w", stretch=(c == "task"))
+        self.tree.pack(fill="x", pady=(1, 6))
+
+        # Log selector + view
+        sel = tk.Frame(self)
+        sel.pack(fill="x")
+        tk.Label(sel, text="Log:", foreground="#444").pack(side="left")
+        self.log_var = tk.StringVar()
+        self.log_combo = ttk.Combobox(sel, textvariable=self.log_var,
+                                      state="readonly", width=22)
+        self.log_combo.pack(side="left", padx=4)
+        self.log_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_source_change())
+        self.follow_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(sel, text="跟随", variable=self.follow_var).pack(side="left", padx=4)
+        tk.Button(sel, text="↓", width=2,
+                   command=lambda: self.log_text.see("end")).pack(side="left")
+
+        # macOS Tk 8.5 has a notorious bug where the Text widget's cursor
+        # blink animation runs as a tight loop, pegging CPU to ~70%.
+        # insertofftime=0 disables blinking entirely; takefocus=False keeps
+        # the (now-static) caret out of focus traversal.
+        self.log_text = scrolledtext.ScrolledText(
+            self, wrap="none", height=10,
+            font=("SF Mono", 10),
+            bg="#1a1d22", fg="#dde3ea",
+            insertofftime=0, insertontime=0, takefocus=False,
+            relief="flat", borderwidth=0,
+        )
+        self.log_text.pack(fill="both", expand=True, pady=(4, 0))
+        self.log_text.configure(state="disabled")
+
+        self._sources: dict[str, Path] = {}
+        self._current_path: Path | None = None
+        self._last_log_mtime = 0.0
+        self._last_log_text = ""  # skip Tk redraw when content unchanged
+        self._busy = False
+
+    # --- start / stop ---
+    def _start_team(self):
+        if self._busy:
+            return
+        self._busy = True
+        self.start_btn.configure(state="disabled", text="启动中…")
+        n = self.n_var.get().strip() or "1"
+
+        def run():
+            try:
+                subprocess.run(
+                    [str(ROOT / "bin" / "tm-team-up"), n, "--no-dashboard"],
+                    cwd=str(ROOT), capture_output=True, timeout=60,
+                )
+            except Exception:
+                pass
+            self.after(0, self._restore_buttons)
+
+        import threading
+        threading.Thread(target=run, daemon=True).start()
+
+    def _stop_team(self):
+        if self._busy:
+            return
+        self._busy = True
+        self.stop_btn.configure(state="disabled", text="停止中…")
+
+        def run():
+            try:
+                env = os.environ.copy()
+                env["TM_TEAM_DOWN"] = "1"
+                subprocess.run(
+                    [str(ROOT / "bin" / "tm-team-up")],
+                    cwd=str(ROOT), env=env, capture_output=True, timeout=30,
+                )
+            except Exception:
+                pass
+            self.after(0, self._restore_buttons)
+
+        import threading
+        threading.Thread(target=run, daemon=True).start()
+
+    def _restore_buttons(self):
+        self._busy = False
+        self.start_btn.configure(state="normal", text="▶ 启动")
+        self.stop_btn.configure(state="normal", text="■ 停止")
+
+    # --- update ---
+    def refresh(self):
+        running = pid_alive(PM_PID)
+        self.pm_lbl.configure(
+            text=("● PM" if running else "○ PM"),
+            foreground=("#2ea54a" if running else "#888"),
+        )
+        wd_run = pid_alive(WATCHDOG_PID)
+        self.wd_lbl.configure(
+            text=("wd●" if wd_run else "wd○"),
+            foreground=("#2ea54a" if wd_run else "#888"),
+        )
+
+        s = read_state()
+        tasks = s.get("tasks", [])
+        done = sum(1 for t in tasks if t.get("status") == "done")
+        inpg = sum(1 for t in tasks if t.get("status") == "in-progress")
+        fail = sum(1 for t in tasks if t.get("status") == "failed")
+        todo = len(tasks) - done - inpg - fail
+        self.progress_lbl.configure(
+            text=f"{done}/{len(tasks)} done · {inpg} in-progress · {todo} todo · {fail} failed"
+        )
+
+        # Workers
+        task_by_id = {t["id"]: t for t in tasks if "id" in t}
+        sid_to_pid = self._scan_pidfiles()
+        existing = set(self.tree.get_children())
+        wanted = set()
+        workers = s.get("workers", {})
+        for sid, w in workers.items():
+            role = w.get("role", "executor")
+            cur_id = w.get("current_task_id")
+            cur = ""
+            if cur_id is not None:
+                t = task_by_id.get(cur_id)
+                title = (t.get("title", "") if t else "")[:80]
+                cur = f"#{cur_id}  {title}"
+            pid = sid_to_pid.get(role, "")
+            uptime = fmt_uptime(w.get("started_ts", ""))
+            row = (role, sid[:10], pid, w.get("status", "?"), uptime, cur)
+            wanted.add(sid)
+            if sid in existing:
+                self.tree.item(sid, values=row)
+            else:
+                self.tree.insert("", "end", iid=sid, values=row)
+        for iid in existing - wanted:
+            try:
+                self.tree.delete(iid)
+            except Exception:
+                pass
+        # Empty-state placeholder so the table never looks broken.
+        if not workers:
+            placeholder_iid = "_empty_"
+            row = ("—", "—", "—", "—", "—", EMPTY_WORKERS_HINT)
+            if placeholder_iid in self.tree.get_children():
+                self.tree.item(placeholder_iid, values=row)
+            else:
+                self.tree.insert("", "end", iid=placeholder_iid, values=row)
+        else:
+            try:
+                self.tree.delete("_empty_")
+            except Exception:
+                pass
+
+        # Log sources
+        srcs = discover_log_sources()
+        if list(srcs.keys()) != list(self._sources.keys()):
+            self._sources = srcs
+            self.log_combo["values"] = list(srcs.keys())
+            if self.log_var.get() not in srcs and srcs:
+                self.log_var.set(next(iter(srcs.keys())))
+                self._on_source_change()
+
+        self._update_log_text()
+
+    def _scan_pidfiles(self) -> dict:
+        if not PIDS_DIR.is_dir():
+            return {}
+        out = {}
+        for f in PIDS_DIR.glob("agent-*.pid"):
+            stem = f.stem.replace("agent-", "")
+            try:
+                pid = int(f.read_text().strip())
+                # role-key like "supervisor" or "executor-1"; first segment ≈ role
+                role = stem.split("-")[0]
+                out[role] = str(pid)
+            except Exception:
+                pass
+        return out
+
+    def _on_source_change(self):
+        key = self.log_var.get()
+        self._current_path = self._sources.get(key)
+        self._last_log_mtime = 0.0  # force one redraw on switch
+        self._update_log_text(force_bottom=True)
+
+    def _update_log_text(self, force_bottom=False):
+        # Skip the heavy redraw when nothing changed — Tk 8.5 re-measures the
+        # ENTIRE text on every delete/insert, which blows up CPU on macOS.
+        path = self._current_path
+        if path is not None and path.exists():
+            mtime = path.stat().st_mtime
+            if mtime == self._last_log_mtime and not force_bottom:
+                return
+            self._last_log_mtime = mtime
+            text = tail_text(path)
+            if not text.strip():
+                text = EMPTY_LOG_HINT
+        else:
+            text = EMPTY_LOG_HINT
+            self._last_log_mtime = -1.0
+
+        # Even if mtime changed, the visible tail might be identical (the
+        # change was in bytes we already trimmed off the head). Compare text
+        # before paying the redraw cost.
+        if text == self._last_log_text and not force_bottom:
+            return
+        self._last_log_text = text
+
+        was_at_bottom = self._is_at_bottom()
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.insert("end", text)
+        self.log_text.configure(state="disabled")
+        if force_bottom or (self.follow_var.get() and was_at_bottom):
+            self.log_text.see("end")
+
+    def _is_at_bottom(self):
+        try:
+            _, bot = self.log_text.yview()
+            return bot > 0.97
+        except Exception:
+            return True
+
+
+# ---------------------------------------------------------------- issues tab -
+class IssuesTab(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, padx=4, pady=4)
+        top = tk.Frame(self)
+        top.pack(fill="x", pady=(0, 4))
+        self.repo_lbl = tk.Label(top, text="repo: —", font=("Helvetica", 11, "bold"))
+        self.repo_lbl.pack(side="left")
+        self.sync_btn = tk.Button(top, text="同步", command=self._sync_now)
+        self.sync_btn.pack(side="right")
+        self._syncing = False
+
+        tk.Label(self, text="Escalation → Issue", foreground="#444",
+                  font=("Helvetica", 10, "bold")).pack(anchor="w")
+        cols = ("file", "issue", "title")
+        widths = (140, 70, 320)
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=8)
+        for c, w in zip(cols, widths):
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=w, anchor="w", stretch=(c == "title"))
+        self.tree.pack(fill="both", expand=True, pady=(1, 4))
+
+        self.summary = tk.Label(self, text="—", foreground="#666")
+        self.summary.pack(anchor="w")
+
+    def refresh(self):
+        repo = detect_repo()
+        self.repo_lbl.configure(text=f"repo: {repo or '(no remote)'}")
+
+        mapping = {}
+        if GH_MAP.exists():
+            try:
+                mapping = json.loads(GH_MAP.read_text())
+            except Exception:
+                mapping = {}
+
+        existing = set(self.tree.get_children())
+        wanted = set()
+        for fname, info in mapping.items():
+            if isinstance(info, dict):
+                num = info.get("number") or info.get("issue") or "—"
+                title = info.get("title", "")
+                state = info.get("state", "")
+            else:
+                num = info
+                title, state = "", ""
+            issue_cell = f"#{num}" + (f" ({state})" if state else "")
+            row = (fname, issue_cell, title)
+            wanted.add(fname)
+            if fname in existing:
+                self.tree.item(fname, values=row)
+            else:
+                self.tree.insert("", "end", iid=fname, values=row)
+        for iid in existing - wanted:
+            try:
+                self.tree.delete(iid)
+            except Exception:
+                pass
+        if not mapping:
+            placeholder_iid = "_empty_"
+            row = ("—", "—", EMPTY_ISSUES_HINT)
+            if placeholder_iid in self.tree.get_children():
+                self.tree.item(placeholder_iid, values=row)
+            else:
+                self.tree.insert("", "end", iid=placeholder_iid, values=row)
+        else:
+            try:
+                self.tree.delete("_empty_")
+            except Exception:
+                pass
+
+        on_disk = sum(1 for _ in ESC_DIR.glob("task-*.md")) if ESC_DIR.is_dir() else 0
+        if GH_MAP.exists():
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S",
+                                  time.localtime(GH_MAP.stat().st_mtime))
+        else:
+            mtime = "(never)"
+        self.summary.configure(
+            text=f"escalations on disk: {on_disk}  ·  mapped: {len(mapping)}  ·  last sync: {mtime}"
+        )
+
+    def _sync_now(self):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.sync_btn.configure(state="disabled", text="同步中…")
+
+        def done_cb():
+            self._syncing = False
+            self.sync_btn.configure(state="normal", text="同步")
+
+        def run():
+            try:
+                subprocess.run(
+                    [str(ROOT / "bin" / "tm-github-sync")],
+                    cwd=str(ROOT), capture_output=True, timeout=120,
+                )
+            except Exception:
+                pass
+            self.after(0, done_cb)
+
+        import threading
+        threading.Thread(target=run, daemon=True).start()
+
+
+# ---------------------------------------------------------------- app --------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"ZeroProgramer · {ROOT.name}")
+        self.geometry("620x460")
+        self.minsize(520, 380)
+
+        # Theme — on macOS keep the native aqua theme (clam can cause blank
+        # paint glitches with some widget combinations). On Linux clam is
+        # nicer-looking; pick per platform.
+        try:
+            if sys.platform == "darwin":
+                ttk.Style(self).theme_use("aqua")
+            else:
+                ttk.Style(self).theme_use("clam")
+        except Exception:
+            pass
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=4, pady=(4, 2))
+        self.iter_tab = IterationTab(nb)
+        self.issues_tab = IssuesTab(nb)
+        nb.add(self.iter_tab, text=" 迭代项目 ")
+        nb.add(self.issues_tab, text=" Issue ")
+        nb.select(0)
+
+        self.status_var = tk.StringVar(value="—")
+        tk.Label(self, textvariable=self.status_var, anchor="w",
+                  foreground="#888", font=("Helvetica", 9)).pack(
+            fill="x", side="bottom", padx=6, pady=(0, 3))
+
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        # On macOS Python.app, a Tk window can spawn without ever being
+        # mapped to the foreground — user sees nothing or a blank rect.
+        # Force it to actually appear and grab focus on first paint.
+        if sys.platform == "darwin":
+            try:
+                # Step 1: ensure all queued layout work flushes before we paint
+                self.update_idletasks()
+                # Step 2: bring window to front of its app's window list
+                self.lift()
+                # Step 3: brief topmost flicker forces macOS to render & focus it
+                self.attributes("-topmost", True)
+                self.after(200, lambda: self.attributes("-topmost", False))
+                # Step 4: pull keyboard focus so it's not just visible but ready
+                self.focus_force()
+            except Exception:
+                pass
+
+        self._tick_n = 0
+        # Defer first tick slightly so layout settles before we redraw.
+        self.after(80, self._tick)
+
+    def _tick(self):
+        self._tick_n += 1
+        try:
+            self.iter_tab.refresh()
+            # Issues tab is mostly static (git remote, .gh-issue-map.json,
+            # escalations dir). Only refresh every Nth tick.
+            if self._tick_n == 1 or self._tick_n % ISSUES_REFRESH_EVERY_N_TICKS == 0:
+                self.issues_tab.refresh()
+            self.status_var.set(
+                f"{time.strftime('%H:%M:%S')} · {ROOT.name}"
+            )
+        except Exception as e:
+            self.status_var.set(f"err: {e}")
+        self.after(REFRESH_MS, self._tick)
+
+
+def main():
+    App().mainloop()
+
+
+if __name__ == "__main__":
+    main()
