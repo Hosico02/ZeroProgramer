@@ -187,12 +187,16 @@ def cmd_tick(args) -> int:
         except Exception as e:
             _log(bot_root, f"reap pm-state failed: {e}")
 
-    # GC: drop terminal-state entries from state.json (user-requested — keep
-    # the file small so future ticks read less). Audit trail lives in PM's
-    # own state and in GitHub itself.
+    # GC: only drop entries whose GitHub issue is no longer in the live list
+    # AND whose ledger status is terminal. Live-but-terminal entries MUST be
+    # kept — otherwise the watcher forgets we already handled them and re-spawns
+    # a fixer on the next tick. issues_by_num holds what `gh issue list` just
+    # returned (open issues with the auto-fix label).
     gc_count = 0
+    live_nums = {str(i["number"]) for i in issues}
     for num in [k for k, r in led.issues.items()
-                if r.status in ("resolved", "failed", "cancelled")]:
+                if r.status in ("resolved", "failed", "cancelled")
+                and k not in live_nums]:
         del led.issues[num]
         gc_count += 1
 
