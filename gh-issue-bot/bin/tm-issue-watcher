@@ -96,12 +96,20 @@ def _spawn_fixer(bot_root: Path, issue_num: str) -> str | None:
         return None
     log_path = bot_root / f"resolve-{issue_num}.log"
     log_path.write_text(f"--- {_now_iso()} starting resolve #{issue_num} ---\n")
+    cfg = load_config(bot_root)
     try:
         with open(log_path, "ab") as logf:
             subprocess.Popen(
                 [str(resolver), str(issue_num)],
                 stdout=logf, stderr=logf,
-                env={**os.environ, "TM_BOT_ROOT": str(bot_root)},
+                env={
+                    **os.environ,
+                    "TM_BOT_ROOT": str(bot_root),
+                    "TM_GH_REPO": cfg.repo,
+                    "TM_ISSUE_BRANCH_PREFIX": cfg.branch_prefix,
+                    "TM_ISSUE_FAIL_LABEL": cfg.fail_label,
+                    "TM_ISSUE_MAX_DIFF_LINES": str(cfg.max_diff_lines),
+                },
                 start_new_session=True,
                 cwd=str(bot_root),
             )
